@@ -1,0 +1,16 @@
+# ~/.acshrc -- acsh startup file
+#
+# This file is sourced once, at shell startup, exactly like typing its
+# lines at the prompt yourself. acsh's built-in default aliases (ll,
+# la, .., ..., grep) are already loaded before this file runs, so you
+# only need to list overrides or additions here.
+#
+# This file existing and being non-empty is itself part of acsh's
+# pitch vs ash: switching to bash on Alpine leaves you with an empty
+# .bashrc and no explanation. Copy this file to ~/.acshrc to get
+# sensible interactive defaults out of the box.
+
+alias ls='ls --color=auto'
+alias l='ls -CF'
+
+export EDITOR=vi
