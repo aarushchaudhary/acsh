@@ -31,10 +31,20 @@
  * MUST be expanded), read_word() wraps single-quoted content in the
  * sentinel bytes SQ_START/SQ_END. env_expand() (env.c) recognizes
  * these, skips expanding '$' between them, and strips the sentinels
- * back out before returning the final string. */
+ * back out before returning the final string.
+ *
+ * Tilde expansion (~ -> $HOME) only ever applies when the ~ is the
+ * very first character of a word AND that character was not quoted
+ * (single or double). To let env_expand() know this without a full
+ * per-character quote-tracking scheme, read_word() prefixes the
+ * output with the sentinel byte QUOTED_FIRST whenever the word's
+ * first character came from inside ANY quote type -- env_expand()
+ * checks for this one flag before attempting tilde expansion, then
+ * strips it. */
 
-#define SQ_START '\x01'
-#define SQ_END   '\x02'
+#define SQ_START     '\x01'
+#define SQ_END       '\x02'
+#define QUOTED_FIRST '\x03'
 
 #define MAX_TOKENS 256
 
@@ -45,6 +55,8 @@
 static int read_word(char **pp, char *buf, size_t bufsize) {
     char *p = *pp;
     size_t len = 0;
+    int is_first_char = 1;
+    int first_char_quoted = 0;
 
     while (*p != '\0') {
         if (*p == ' ' || *p == '\t' ||
@@ -55,6 +67,7 @@ static int read_word(char **pp, char *buf, size_t bufsize) {
             if (*p == '\'') {
                 /* single-quoted: copy verbatim until the closing quote,
                  * wrapped in sentinels so env_expand() skips it */
+                if (is_first_char) { first_char_quoted = 1; is_first_char = 0; }
                 p++;
                 if (len + 1 >= bufsize) goto too_long;
                 buf[len++] = SQ_START;
@@ -75,6 +88,7 @@ static int read_word(char **pp, char *buf, size_t bufsize) {
             if (*p == '"') {
                 /* double-quoted: copy verbatim, but \" \\ \$ stay escapes;
                  * $VAR expansion still applies later, so no sentinels here */
+                if (is_first_char) { first_char_quoted = 1; is_first_char = 0; }
                 p++;
                 while (*p != '\0' && *p != '"') {
                     if (*p == '\\' && (p[1] == '"' || p[1] == '\\' || p[1] == '$')) {
@@ -96,6 +110,7 @@ static int read_word(char **pp, char *buf, size_t bufsize) {
 
             if (*p == '\\' && p[1] != '\0') {
                 /* backslash outside quotes escapes exactly the next char */
+                is_first_char = 0;
                 if (len + 1 >= bufsize) goto too_long;
                 buf[len++] = p[1];
                 p += 2;
@@ -104,10 +119,20 @@ static int read_word(char **pp, char *buf, size_t bufsize) {
 
             if (len + 1 >= bufsize) goto too_long;
             buf[len++] = *p++;
+        is_first_char = 0;
     }
 
     buf[len] = '\0';
     *pp = p;
+
+    if (first_char_quoted) {
+        /* shift everything right by one and prefix the marker byte,
+         * so env_expand() can check buf[0] == QUOTED_FIRST cheaply */
+        if (len + 2 >= bufsize) goto too_long;
+        memmove(buf + 1, buf, len + 1); /* +1 to move the NUL too */
+        buf[0] = QUOTED_FIRST;
+    }
+
     return 0;
 
     too_long:

@@ -53,11 +53,30 @@ static void run_line(char *line, int record_history) {
     free(expanded); /* safe no-op if expanded is NULL */
 }
 
-/* Runs ~/.acshrc at startup if it exists, one line at a time, the same
- * way an interactive user would type them (so `alias`, `export`, etc.
- * in the rc file behave exactly like typing them at the prompt). This
- * directly answers the community complaint that switching shells on
- * Alpine leaves you with an empty, unhelpful rc file. */
+/* Runs every line of the file at `path` through run_line(), the same
+ * way an interactive user would type them one by one. Used by
+ * load_rc_file() below and by the `source` / `.` builtin
+ * (builtins.c), so a script sourced manually behaves identically to
+ * ~/.acshrc at startup. Lines run this way are never added to
+ * history -- only lines actually typed at the interactive prompt are. */
+int run_script_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        fprintf(stderr, "acsh: %s: no such file or directory\n", path);
+        return -1;
+    }
+
+    char line[ACSH_MAX_LINE];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        run_line(line, /*record_history=*/0);
+    }
+    fclose(f);
+    return 0;
+}
+
+/* Runs ~/.acshrc at startup if it exists. This directly answers the
+ * community complaint that switching shells on Alpine leaves you with
+ * an empty, unhelpful rc file. */
 static void load_rc_file(void) {
     const char *home = getenv("HOME");
     if (home == NULL) {
@@ -67,16 +86,16 @@ static void load_rc_file(void) {
     char path[512];
     snprintf(path, sizeof(path), "%s/.acshrc", home);
 
-    FILE *f = fopen(path, "r");
-    if (f == NULL) {
-        return; /* no rc file -- fine, defaults already loaded */
+    /* silently skip if missing -- defaults are already loaded and an
+     * absent rc file is a completely normal, expected case, not an
+     * error worth printing */
+    FILE *probe = fopen(path, "r");
+    if (probe == NULL) {
+        return;
     }
+    fclose(probe);
 
-    char line[ACSH_MAX_LINE];
-    while (fgets(line, sizeof(line), f) != NULL) {
-        run_line(line, /*record_history=*/0);
-    }
-    fclose(f);
+    run_script_file(path);
 }
 
 int main(void) {

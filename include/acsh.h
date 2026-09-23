@@ -186,4 +186,13 @@ void history_save_append(void);
 /* Prints the `history` builtin's numbered listing. */
 void history_print_all(void);
 
+/* ---- main.c ----
+ *
+ * Exposed so the `source` / `.` builtin (builtins.c) can run an
+ * arbitrary script file through the exact same run_line() path used
+ * for both the interactive prompt and ~/.acshrc, rather than
+ * duplicating that logic. Returns 0 on success, -1 if the file
+ * couldn't be opened (message already printed). */
+int run_script_file(const char *path);
+
 #endif /* ACSH_H */

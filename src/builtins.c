@@ -209,6 +209,14 @@ static int builtin_history(void) {
     return 0;
 }
 
+static int builtin_source(Command *cmd) {
+    if (cmd->argc < 2) {
+        fprintf(stderr, "acsh: source: usage: source FILE\n");
+        return 1;
+    }
+    return (run_script_file(cmd->argv[1]) == 0) ? 0 : 1;
+}
+
 int try_run_builtin(Command *cmd, int *exit_status) {
     if (cmd->argc == 0 || cmd->argv[0] == NULL) {
         return 0;
@@ -256,6 +264,10 @@ int try_run_builtin(Command *cmd, int *exit_status) {
     }
     if (strcmp(cmd->argv[0], "history") == 0) {
         *exit_status = builtin_history();
+        return 1;
+    }
+    if (strcmp(cmd->argv[0], "source") == 0 || strcmp(cmd->argv[0], ".") == 0) {
+        *exit_status = builtin_source(cmd);
         return 1;
     }
 
