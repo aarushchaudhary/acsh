@@ -264,19 +264,125 @@ int parse_line(char *line, Pipeline *pl) {
             continue;
         }
 
-        /* regular argument word */
-        if (cur->argc >= ACSH_MAX_ARGS - 1) {
-            fprintf(stderr, "acsh: too many arguments\n");
-            free_tokens(tokens, ntok);
-            return -1;
+        /* regular argument word: env_expand ($VAR, ~) happens first,
+         * then glob_expand (star, ?, [) against the result -- this
+         * order matters, e.g. "$DIR" followed by "star.c" must expand
+         * DIR before globbing. A single word can expand into MULTIPLE
+         * argv entries here (e.g. star.c -> main.c parser.c ...). */
+        {
+            char *var_expanded = env_expand(tok);
+            if (var_expanded == NULL) {
+                fprintf(stderr, "acsh: out of memory\n");
+                free_tokens(tokens, ntok);
+                return -1;
+            }
+
+            char *glob_results[ACSH_MAX_ARGS];
+            int nglob = glob_expand(var_expanded, glob_results, ACSH_MAX_ARGS - cur->argc - 1);
+            free(var_expanded);
+
+            for (int g = 0; g < nglob; g++) {
+                if (cur->argc >= ACSH_MAX_ARGS - 1) {
+                    fprintf(stderr, "acsh: too many arguments\n");
+                    free_tokens(tokens, ntok);
+                    return -1;
+                }
+                cur->argv[cur->argc] = glob_results[g];
+                cur->argc++;
+            }
         }
-        cur->argv[cur->argc] = env_expand(tok);
-        cur->argc++;
     }
 
     cur->argv[cur->argc] = NULL;
     pl->num_cmds = ci + 1;
 
     free_tokens(tokens, ntok);
+    return 0;
+}
+
+/* Lightweight quote-aware scan used ONLY to find the split points for
+ * &&, ||, and ; -- this does NOT do full tokenizing (no word
+ * decoding, no escape handling); it just needs to track whether we're
+ * currently inside a ' or " so that e.g.  echo "a && b"  is NOT split
+ * into two segments. Full decoding (and $VAR/$?/alias expansion)
+ * happens later, per-segment, just before each one executes -- see
+ * execute_chain() in executor.c for why that ordering matters. */
+int parse_chain(const char *line, Chain *ch) {
+    ch->num_segments = 0;
+
+    const char *seg_start = line;
+    const char *p = line;
+    char in_quote = '\0'; /* '\0' = not in a quote, else the quote char */
+
+    while (1) {
+        int is_end_of_line = (*p == '\0');
+        int split_here = 0;
+        ChainOp op = CHAIN_END;
+        int consume = 0; /* how many chars the operator itself takes */
+
+        if (!is_end_of_line && in_quote == '\0') {
+            if (*p == '\'' || *p == '"') {
+                in_quote = *p;
+            } else if (*p == '&' && p[1] == '&') {
+                split_here = 1; op = CHAIN_AND; consume = 2;
+            } else if (*p == '|' && p[1] == '|') {
+                split_here = 1; op = CHAIN_OR; consume = 2;
+            } else if (*p == ';') {
+                split_here = 1; op = CHAIN_SEQ; consume = 1;
+            }
+        } else if (!is_end_of_line && in_quote != '\0') {
+            if (*p == in_quote) {
+                in_quote = '\0';
+            }
+            /* NOTE: this simple scan doesn't special-case backslash-
+             * escaped quotes inside "..." (e.g. "a \" && b") -- an
+             * acceptable simplification for a mini-project; real
+             * shells handle this via full tokenizing at this stage. */
+        }
+
+        if (split_here || is_end_of_line) {
+            size_t seg_len = (size_t)(p - seg_start);
+
+            /* trim leading/trailing whitespace from the segment so an
+             * empty/whitespace-only segment (e.g. leading ";;" or
+             * trailing "&&") is correctly detected as empty below */
+            const char *trim_start = seg_start;
+            const char *trim_end = seg_start + seg_len;
+            while (trim_start < trim_end && (*trim_start == ' ' || *trim_start == '\t')) trim_start++;
+            while (trim_end > trim_start && (trim_end[-1] == ' ' || trim_end[-1] == '\t')) trim_end--;
+            size_t trimmed_len = (size_t)(trim_end - trim_start);
+
+            if (trimmed_len > 0) {
+                if (ch->num_segments >= ACSH_MAX_CHAIN) {
+                    fprintf(stderr, "acsh: too many chained commands\n");
+                    return -1;
+                }
+                if (trimmed_len >= ACSH_MAX_LINE) {
+                    fprintf(stderr, "acsh: chained command too long\n");
+                    return -1;
+                }
+                memcpy(ch->segments[ch->num_segments], trim_start, trimmed_len);
+                ch->segments[ch->num_segments][trimmed_len] = '\0';
+                ch->ops[ch->num_segments] = is_end_of_line ? CHAIN_END : op;
+                ch->num_segments++;
+            }
+
+            if (is_end_of_line) {
+                break;
+            }
+
+            p += consume;
+            seg_start = p;
+            continue;
+        }
+
+        p++;
+    }
+
+    if (in_quote != '\0') {
+        fprintf(stderr, "acsh: syntax error: unterminated %c\n", in_quote);
+        return -1;
+    }
+
     return 0;
 }

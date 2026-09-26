@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c11 -Iinclude
-SRC     = src/main.c src/parser.c src/executor.c src/builtins.c src/jobs.c src/signals.c src/env.c src/alias.c src/history.c
+SRC     = src/main.c src/parser.c src/executor.c src/builtins.c src/jobs.c src/signals.c src/env.c src/alias.c src/history.c src/glob.c src/control_flow.c
 TARGET  = acsh
 
 all: $(TARGET)

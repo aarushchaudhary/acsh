@@ -18,6 +18,22 @@ static int is_var_char(char c) {
     return isalnum((unsigned char)c) || c == '_';
 }
 
+/* Holds the exit status of the most recently completed pipeline, so
+ * $? can expand to it. Set by env_set_last_status(), called from
+ * execute_chain() (executor.c) after each pipeline finishes -- this
+ * is the same value POSIX shells expose as $?. */
+static int last_exit_status = 0;
+
+void env_set_last_status(int status) {
+    last_exit_status = status;
+}
+
+/* Getter counterpart, used by control_flow.c to read back a
+ * condition/body chain's exit status without re-parsing "$?" text. */
+int env_get_last_status(void) {
+    return last_exit_status;
+}
+
 char *env_expand(const char *word) {
     /* Strip the QUOTED_FIRST marker (if present) and remember whether
      * it was there -- it tells us the word's first character came
@@ -83,6 +99,29 @@ char *env_expand(const char *word) {
             }
 
             /* *p == '$' and we are NOT inside single quotes */
+
+            if (*(p + 1) == '?') {
+                /* $? -- exit status of the last completed pipeline. Kept
+                 * as a special case here rather than a real getenv() var,
+                 * since it changes after every command and isn't part of
+                 * the process environment -- exactly how POSIX shells
+                 * treat it (a shell-internal parameter, not a real
+                 * variable). */
+                p += 2; /* skip '$' and '?' */
+                char code_str[16];
+                int code_len = snprintf(code_str, sizeof(code_str), "%d", last_exit_status);
+                if (code_len > 0) {
+                    size_t vlen = (size_t)code_len;
+                    while (len + vlen + 1 >= cap) {
+                        cap *= 2;
+                        out = realloc(out, cap);
+                    }
+                    memcpy(out + len, code_str, vlen);
+                    len += vlen;
+                }
+                continue;
+            }
+
             const char *name_start;
             size_t name_len;
             p++; /* skip '$' */

@@ -15,6 +15,33 @@ void set_foreground_pgid(pid_t pgid) {
     foreground_pgid = pgid;
 }
 
+/* Blocks/unblocks SIGCHLD around a foreground pipeline's own waitpid()
+ * loop in executor.c. This closes a real race: without it, the async
+ * sigchld_handler() below can reap a foreground child (via its own
+ * WNOHANG waitpid loop) BEFORE execute_pipeline()'s explicit waitpid
+ * gets a chance to see it -- when that happens, execute_pipeline()'s
+ * waitpid immediately fails with ECHILD ("no child to wait for") and
+ * silently falls back to its initialized exit status of 0, which
+ * broke &&/||/; chaining for any foreground pipeline whose last stage
+ * failed (e.g. `true | false && echo x` incorrectly ran the `echo`).
+ * Blocking SIGCHLD guarantees the child's death is only ever observed
+ * by execute_pipeline()'s own waitpid, never stolen by the handler.
+ * This is the same technique real shells (e.g. bash's job control)
+ * use for this exact hazard. */
+void block_sigchld(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+}
+
+void unblock_sigchld(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+}
+
 /* SIGCHLD fires whenever ANY child changes state (exits, is killed, or
  * is stopped). We reap every child we can with a non-blocking
  * waitpid(-1, ..., WNOHANG) loop so zombies never pile up, and update

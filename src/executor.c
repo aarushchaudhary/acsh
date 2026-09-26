@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L  /* setpgid, WUNTRACED under -std=c11 */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -43,7 +44,21 @@ static void reset_child_signals(void) {
     signal(SIGCHLD, SIG_DFL);
 }
 
-void execute_pipeline(Pipeline *pl) {
+/* Converts a raw wait() status into a shell-style exit code: normal
+ * exit -> the exit() value (0-255); killed by signal -> 128+signum,
+ * which is the same convention bash/ash use so `$?` after a
+ * Ctrl+C-killed command reads the way people expect. */
+static int status_to_exit_code(int status) {
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return 0;
+}
+
+int execute_pipeline(Pipeline *pl) {
     int n = pl->num_cmds;
 
     /* Single command, no pipe: check builtins first. Builtins must run
@@ -52,7 +67,7 @@ void execute_pipeline(Pipeline *pl) {
     if (n == 1) {
         int exit_status = 0;
         if (try_run_builtin(&pl->cmds[0], &exit_status)) {
-            return;
+            return exit_status;
         }
     }
 
@@ -68,14 +83,14 @@ void execute_pipeline(Pipeline *pl) {
         if (have_next) {
             if (pipe(pipefd) < 0) {
                 perror("acsh: pipe");
-                return;
+                return 1;
             }
         }
 
         pid_t pid = fork();
         if (pid < 0) {
             perror("acsh: fork");
-            return;
+            return 1;
         }
 
         if (pid == 0) {
@@ -128,34 +143,104 @@ void execute_pipeline(Pipeline *pl) {
         }
     }
 
+    pid_t last_pid = pids[n - 1];
+
     if (pl->background) {
         int job_id = jobs_add(pgid, pids, n, pl->raw_line);
         printf("[%d] %d\n", job_id, pgid);
         /* do NOT wait -- shell returns to the prompt immediately;
-         * SIGCHLD handler in signals.c reaps it whenever it finishes */
-    } else {
-        /* foreground: tell the signal handlers who Ctrl+C/Ctrl+Z
-         * should go to, then block until the whole pipeline is done
-         * or stopped. */
-        set_foreground_pgid(pgid);
+         * SIGCHLD handler in signals.c reaps it whenever it finishes.
+         * A backgrounded pipeline has no exit status to report yet,
+         * so &&/||/; after it always treat it as success (POSIX's
+         * behaviour for `cmd &` is exactly this: $? is 0 right away). */
+        return 0;
+    }
 
-        int status;
-        int remaining = n;
-        while (remaining > 0) {
-            pid_t w = waitpid(-pgid, &status, WUNTRACED);
-            if (w < 0) {
-                break; /* ECHILD: nothing left to wait for */
+    /* foreground: tell the signal handlers who Ctrl+C/Ctrl+Z should go
+     * to, then block until the whole pipeline is done or stopped. We
+     * specifically capture the LAST command's exit status, since a
+     * pipeline's overall status in POSIX is the last stage's status
+     * (e.g. `false | true` "succeeds" even though `false` failed).
+     *
+     * SIGCHLD is blocked for the duration of this wait loop to avoid
+     * a race with the async sigchld_handler (see block_sigchld()'s
+     * comment in signals.c for the full explanation). */
+    set_foreground_pgid(pgid);
+    block_sigchld();
+
+    int status = 0;
+    int last_exit_code = 0;
+    int remaining = n;
+    while (remaining > 0) {
+        pid_t w = waitpid(-pgid, &status, WUNTRACED);
+        if (w < 0) {
+            break; /* ECHILD: nothing left to wait for */
+        }
+        if (WIFSTOPPED(status)) {
+            /* user hit Ctrl+Z: register as a stopped job and give the
+             * prompt back, like a real shell would. Exit status is
+             * left at whatever it was (POSIX behaviour here varies by
+             * shell; treating it as "success so far" is reasonable
+             * for this mini-project's scope). */
+            jobs_add(pgid, pids, n, pl->raw_line);
+            jobs_mark_stopped(pgid);
+            break;
+        }
+        if (w == last_pid) {
+            last_exit_code = status_to_exit_code(status);
+        }
+        remaining--;
+    }
+
+    unblock_sigchld();
+    set_foreground_pgid(0); /* back to "nothing in foreground" */
+    return last_exit_code;
+}
+
+void execute_chain(Chain *ch) {
+    int status = 0;
+
+    for (int i = 0; i < ch->num_segments; i++) {
+        if (i > 0) {
+            ChainOp prev_op = ch->ops[i - 1];
+            if (prev_op == CHAIN_AND && status != 0) {
+                continue; /* previous failed, skip this && stage */
             }
-            if (WIFSTOPPED(status)) {
-                /* user hit Ctrl+Z: register as a stopped job and give
-                 * the prompt back, like a real shell would */
-                jobs_add(pgid, pids, n, pl->raw_line);
-                jobs_mark_stopped(pgid);
-                break;
+            if (prev_op == CHAIN_OR && status == 0) {
+                continue; /* previous succeeded, skip this || stage */
             }
-            remaining--;
+            /* CHAIN_SEQ (;) always runs the next stage regardless */
         }
 
-        set_foreground_pgid(0); /* back to "nothing in foreground" */
+        /* Alias expansion happens on this stage's raw text, exactly
+         * now -- not upfront -- so `cmd1 ; alias_cmd` can rely on
+         * alias state cmd1 itself might have changed (e.g. cmd1 is
+         * literally `alias foo=bar`). */
+        char *raw = ch->segments[i];
+        char *aliased = alias_expand_line(raw);
+        char *text_to_parse = (aliased != NULL) ? aliased : raw;
+
+        /* parse_line() calls env_expand() on every word as it builds
+         * the Pipeline -- THIS is where $VAR / $? / ~ get resolved,
+         * and it happens right here, per stage, so $? reflects the
+         * PREVIOUS STAGE IN THIS SAME CHAIN, not a stale value from
+         * before the chain started. */
+        Pipeline pl;
+        memset(&pl, 0, sizeof(pl));
+        int rc = parse_line(text_to_parse, &pl);
+        free(aliased);
+
+        if (rc != 0) {
+            /* parse_line already printed the error; stop the chain
+             * here, matching how a real shell aborts on a syntax
+             * error rather than continuing past broken syntax */
+            return;
+        }
+        if (pl.num_cmds == 0) {
+            continue;
+        }
+
+        status = execute_pipeline(&pl);
+        env_set_last_status(status);
     }
 }

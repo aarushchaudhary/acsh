@@ -8,6 +8,7 @@
 #define ACSH_MAX_CMDS      16     /* max commands chained in a pipeline */
 #define ACSH_MAX_ALIASES   32     /* max number of aliases stored       */
 #define ACSH_MAX_JOBS      32     /* max number of tracked background/stopped jobs */
+#define ACSH_MAX_LOOP_ITERATIONS 10000  /* safety cap against runaway while/until loops */
 
 typedef enum {
     JOB_RUNNING,
@@ -55,12 +56,65 @@ typedef struct {
     char    raw_line[ACSH_MAX_LINE]; /* original text, used for job listing */
 } Pipeline;
 
-/* Parsing entry point: fills `pl` from a raw input line. Returns 0 on
+/*
+ * How one Pipeline in a Chain is connected to the NEXT one. Mirrors
+ * exactly how bash/ash decide whether to run the next stage:
+ *   CHAIN_AND  ( && )  run next only if this one exited 0 (success)
+ *   CHAIN_OR   ( || )  run next only if this one exited non-zero
+ *   CHAIN_SEQ  ( ;  )  always run next, unconditionally
+ *   CHAIN_END          this is the last pipeline in the chain
+ */
+typedef enum {
+    CHAIN_AND,
+    CHAIN_OR,
+    CHAIN_SEQ,
+    CHAIN_END
+} ChainOp;
+
+#define ACSH_MAX_CHAIN 16   /* max pipelines joined by &&/||/; on one line */
+
+/*
+ * A full input line, which may contain several pipe-groups joined by
+ * &&, ||, or ;. E.g.  "make && ./acsh || echo failed"  becomes a
+ * Chain of two raw segments: "make" --AND--> "./acsh || echo failed"
+ * (further split lazily). Segments are stored as RAW TEXT, not
+ * pre-parsed Pipelines: parsing (and therefore $VAR/$?/alias
+ * expansion) must happen one stage at a time, immediately before that
+ * stage runs, so that e.g. `false ; echo $?` sees $? from the `false`
+ * that just ran in THIS SAME chain -- expanding every stage upfront
+ * would use the previous LINE's $?, which is wrong.
+ */
+typedef struct {
+    char    segments[ACSH_MAX_CHAIN][ACSH_MAX_LINE];
+    ChainOp ops[ACSH_MAX_CHAIN];   /* ops[i] connects segments[i] to segments[i+1] */
+    int     num_segments;
+} Chain;
+
+/* Parsing entry point: fills `pl` from a raw input line (a single
+ * pipe-connected group only -- no &&/||/; splitting). Returns 0 on
  * success, -1 on a parse error (message already printed). */
 int parse_line(char *line, Pipeline *pl);
 
-/* Execution entry point: runs a fully parsed pipeline. */
-void execute_pipeline(Pipeline *pl);
+/* Splits a raw input line on unquoted &&, ||, and ; into raw text
+ * segments (NOT yet parsed into Pipelines -- see the Chain struct's
+ * comment for why). Returns 0 on success, -1 on a syntax error (e.g.
+ * an unterminated quote spanning the split points). */
+int parse_chain(const char *line, Chain *ch);
+
+/* Execution entry point for one pipe-connected group. Returns the
+ * exit status of the pipeline's last command (0 = success, matching
+ * POSIX $?), so execute_chain() can decide whether &&/|| should run
+ * the next pipeline. For a backgrounded pipeline (trailing &), returns
+ * 0 immediately without waiting, since there's nothing to report yet. */
+int execute_pipeline(Pipeline *pl);
+
+/* Runs every segment in `ch` in order: alias-expands, parses (which
+ * performs $VAR/$?/tilde expansion via env_expand()), then executes
+ * each segment ONE AT A TIME, honoring &&/||/; based on the PREVIOUS
+ * segment's actual exit status from THIS SAME chain. This ordering
+ * (parse-then-run per stage, not all stages upfront) is what makes
+ * `false ; echo $?` correctly see $?==1. */
+void execute_chain(Chain *ch);
 
 /* Builtin dispatch: returns 1 and runs the builtin if cmd->argv[0] is
  * one of acsh's builtins, otherwise returns 0 and does nothing. */
@@ -105,6 +159,13 @@ void signals_init(void);
  * in the foreground (back at the prompt). */
 void set_foreground_pgid(pid_t pgid);
 
+/* Blocks/unblocks SIGCHLD so the async signal handler can't race with
+ * a foreground pipeline's own explicit waitpid() loop in executor.c.
+ * See the long comment above block_sigchld()'s definition for why
+ * this is necessary. */
+void block_sigchld(void);
+void unblock_sigchld(void);
+
 /* ---- env.c: variable expansion ----
  *
  * acsh keeps things simple: `export NAME=value` sets a real process
@@ -117,8 +178,96 @@ void set_foreground_pgid(pid_t pgid);
 /* Expands $VAR and ${VAR} references found inside `word` (which may
  * have come from inside double quotes or be fully unquoted -- single-
  * quoted text should never be passed through this, since $ is literal
- * there). Returns a newly malloc'd string the caller must free(). */
+ * there). Also expands the special $? parameter to the exit status of
+ * the last completed pipeline. Returns a newly malloc'd string the
+ * caller must free(). */
 char *env_expand(const char *word);
+
+/* Records the exit status of the most recently completed pipeline, so
+ * a later $? in env_expand() reports it. Called from execute_chain()
+ * (executor.c) after each pipeline finishes. */
+void env_set_last_status(int status);
+
+/* Reads back the value env_set_last_status() most recently stored.
+ * Used by control_flow.c to get a condition/body chain's exit status
+ * without re-parsing "$?" as text. */
+int env_get_last_status(void);
+
+/* ---- glob.c: pathname expansion (*, ?, [abc]) ----
+ *
+ * A word containing an unquoted glob metacharacter (*, ?, [) is
+ * expanded against the filesystem, e.g. `echo *.c` becomes `echo
+ * main.c parser.c ...`. If the pattern matches nothing, POSIX leaves
+ * the word UNCHANGED (not deleted, not an error) -- e.g. `echo *.xyz`
+ * with no .xyz files just prints the literal string "*.xyz". */
+
+/* Expands `word` (already $VAR/tilde-expanded, still possibly
+ * carrying the QUOTED_FIRST marker from parser.c) into zero or more
+ * matched paths. Writes up to max_results newly malloc'd strings into
+ * `results` and returns how many it wrote. If `word` has no unquoted
+ * glob metacharacters, or matches nothing, writes exactly one result:
+ * `word` itself (duplicated), matching POSIX's "no match = literal"
+ * rule. The caller owns and must free() every string written. */
+int glob_expand(const char *word, char *results[], int max_results);
+
+/* ---- control_flow.c: if / then / else / fi ----
+ *
+ * A deliberately scoped subset of shell control flow: only the
+ * if/then/[elif/then...]/[else]/fi form is supported. while, until,
+ * for, case, and function definitions are explicitly OUT OF SCOPE for
+ * this mini-project (documented in docs/posix_compliance.md) -- they
+ * require the same kind of "read until matching keyword" handling as
+ * if/fi but each has enough of their own special cases (loop bodies
+ * re-executing, case pattern matching, etc.) that adding all of them
+ * was judged not to fit the project's time budget. if/fi was chosen
+ * as the one control-flow construct to implement because it's the
+ * most frequently used in real interactive/script usage.
+ *
+ * Supported forms (each clause's CONDITION and BODY are themselves
+ * ordinary &&/||/;  chains, reusing everything in parser.c/executor.c):
+ *
+ *   if COND; then BODY; fi
+ *   if COND; then BODY; else BODY; fi
+ *   if COND; then BODY; elif COND; then BODY; ...; else BODY; fi
+ *
+ * Both single-line (all on one line, with explicit ; before then/
+ * else/fi) and multi-line (real shell script style, newline-
+ * separated) forms are supported, since run_if_block() reads
+ * additional lines from stdin itself when the construct isn't closed
+ * on the first line it sees. */
+
+/* Returns 1 if `line` (with leading whitespace already skipped) looks
+ * like the start of an if statement (i.e. its first word is "if"). */
+int is_if_statement(const char *line);
+
+/* Same idea as is_if_statement(), for while/until loops. */
+int is_while_statement(const char *line);
+int is_until_statement(const char *line);
+
+/* Runs a full if/then/elif/else/fi construct. `first_line` is the
+ * line that already matched is_if_statement(). If the construct isn't
+ * fully closed within first_line (the common, multi-line script
+ * case), additional lines are read one at a time via `read_more_line`
+ * (typically fgets from stdin) until the matching `fi` is found.
+ * Returns the exit status of whichever branch's body actually ran (0
+ * if no branch matched and there was no else). */
+int run_if_statement(const char *first_line,
+                     char *(*read_more_line)(char *buf, int size));
+
+/* Runs a full while/until...do...done loop construct. `first_line` is
+ * the line that already matched is_while_statement() or
+ * is_until_statement() (`is_until` says which). Reads additional
+ * lines the same way run_if_statement() does when the loop isn't
+ * closed on one line. The condition is re-evaluated, and the body
+ * re-run, each iteration -- exactly like a real shell loop, including
+ * picking up side effects (e.g. a counter variable incremented in the
+ * body) between iterations. Returns the exit status of the last body
+ * execution (0 if the body never ran, matching POSIX for a loop whose
+ * condition was false/true-respectively from the start). A loop is
+ * capped at ACSH_MAX_LOOP_ITERATIONS iterations as a safety net
+ * against an unintentional infinite loop hanging the whole shell. */
+int run_loop_statement(const char *first_line, int is_until,
+                       char *(*read_more_line)(char *buf, int size));
 
 /* ---- alias.c ----
  *

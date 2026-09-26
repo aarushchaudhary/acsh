@@ -17,11 +17,32 @@ static void print_prompt(void) {
     fflush(stdout);
 }
 
-/* Runs exactly one line of shell input: alias expansion, parse,
- * execute. Shared by the interactive REPL and by the ~/.acshrc loader
- * so both go through the identical code path. `record_history`
- * controls whether this line should be added to command history --
- * we don't want rc-file lines cluttering the user's history. */
+/* The FILE* run_line() should read FROM when a multi-line construct
+ * (currently just if/fi) needs more input than fits on the line it
+ * was first called with. Interactive mode points this at stdin;
+ * run_script_file() points it at the script being read. Kept as a
+ * single static since acsh is single-threaded and run_line() is never
+ * reentered while a multi-line construct is still being collected. */
+static FILE *current_input_source = NULL;
+
+/* Adapts fgets(current_input_source) to the char *(*)(char*, int)
+ * signature run_if_statement() expects for reading additional lines. */
+static char *read_more_line_from_current_source(char *buf, int size) {
+    if (current_input_source == NULL) {
+        return NULL;
+    }
+    return fgets(buf, size, current_input_source);
+}
+
+/* Runs exactly one line of shell input: splits it into &&/||/;
+ * connected raw segments, then hands off to execute_chain() (which
+ * alias-expands, parses, and $VAR/$?-expands each segment one at a
+ * time, immediately before running it -- see execute_chain()'s
+ * comment in executor.c for why that ordering matters for $?).
+ * Shared by the interactive REPL and by the ~/.acshrc loader so both
+ * go through the identical code path. `record_history` controls
+ * whether this line should be added to command history -- we don't
+ * want rc-file lines cluttering the user's history. */
 static void run_line(char *line, int record_history) {
     /* strip trailing newline, if any (fgets keeps it) */
     line[strcspn(line, "\n")] = '\0';
@@ -35,22 +56,36 @@ static void run_line(char *line, int record_history) {
         history_save_append();
     }
 
-    /* alias expansion happens on the raw line, BEFORE parsing, since
-     * an alias's expansion text is itself shell syntax (e.g. `alias
-     * ll='ls -l'` must inject "ls -l" as real words, not one opaque
-     * argument) */
-    char *expanded = alias_expand_line(line);
-    char *line_to_parse = (expanded != NULL) ? expanded : line;
-
-    Pipeline pl;
-    memset(&pl, 0, sizeof(pl));
-
-    if (parse_line(line_to_parse, &pl) == 0 && pl.num_cmds > 0) {
-        execute_pipeline(&pl);
+    /* if/then/.../fi is handled as its own construct, separate from
+     * the &&/||/; Chain machinery, since it can span multiple lines
+     * and has its own keyword-based grammar. Detected by first word
+     * only, so this never fires on a line that merely CONTAINS "if"
+     * elsewhere (e.g. `echo "if you can"` is not a syntax error). */
+    if (is_if_statement(line)) {
+        int status = run_if_statement(line, read_more_line_from_current_source);
+        env_set_last_status(status);
+        return;
     }
-    /* else: parser already printed an error message */
+    if (is_while_statement(line)) {
+        int status = run_loop_statement(line, /*is_until=*/0, read_more_line_from_current_source);
+        env_set_last_status(status);
+        return;
+    }
+    if (is_until_statement(line)) {
+        int status = run_loop_statement(line, /*is_until=*/1, read_more_line_from_current_source);
+        env_set_last_status(status);
+        return;
+    }
 
-    free(expanded); /* safe no-op if expanded is NULL */
+    Chain ch;
+    if (parse_chain(line, &ch) != 0) {
+        return; /* parse_chain already printed an error */
+    }
+    if (ch.num_segments == 0) {
+        return;
+    }
+
+    execute_chain(&ch);
 }
 
 /* Runs every line of the file at `path` through run_line(), the same
@@ -66,10 +101,15 @@ int run_script_file(const char *path) {
         return -1;
     }
 
+    FILE *saved_source = current_input_source;
+    current_input_source = f;
+
     char line[ACSH_MAX_LINE];
     while (fgets(line, sizeof(line), f) != NULL) {
         run_line(line, /*record_history=*/0);
     }
+
+    current_input_source = saved_source;
     fclose(f);
     return 0;
 }
@@ -106,6 +146,8 @@ int main(void) {
     alias_load_defaults();  /* ll, la, .., etc. -- before rc file so it can override */
     load_rc_file();
     history_load();
+
+    current_input_source = stdin;
 
     while (1) {
         print_prompt();
