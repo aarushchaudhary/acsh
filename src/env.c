@@ -34,6 +34,62 @@ int env_get_last_status(void) {
     return last_exit_status;
 }
 
+/* Positional parameters ($1, $2, ..., $#, $@) for the CURRENTLY
+ * EXECUTING function call. Kept as a small stack (not just one global
+ * set) so a function calling another function -- including itself,
+ * recursively -- gets its own $1.../$# while it runs, and the outer
+ * call's parameters are correctly restored once the inner call
+ * returns. functions.c pushes a new frame before running a function's
+ * body and pops it afterward; env_expand() below only ever reads the
+ * TOP of this stack, i.e. whichever function call is innermost right
+ * now. Outside of any function call, the stack is empty and $1/$@/$#
+ * all expand to nothing/zero, matching a shell's top-level state. */
+static char *positional_stack[ACSH_MAX_CALL_DEPTH][ACSH_MAX_POSITIONAL_PARAMS];
+static int   positional_count_stack[ACSH_MAX_CALL_DEPTH];
+static int   positional_stack_depth = 0;
+
+void env_push_positional_params(int argc, char *argv[]) {
+    if (positional_stack_depth >= ACSH_MAX_CALL_DEPTH) {
+        /* silently cap recursion depth rather than corrupt the stack;
+         * a function this deep is almost certainly an infinite
+         * recursion bug in the script, not a legitimate use case */
+        return;
+    }
+    int n = argc;
+    if (n > ACSH_MAX_POSITIONAL_PARAMS) {
+        n = ACSH_MAX_POSITIONAL_PARAMS;
+    }
+    for (int i = 0; i < n; i++) {
+        positional_stack[positional_stack_depth][i] = strdup(argv[i]);
+    }
+    positional_count_stack[positional_stack_depth] = n;
+    positional_stack_depth++;
+}
+
+/* Reports how many function calls are currently nested (i.e. how many
+ * frames env_push_positional_params() has pushed without a matching
+ * pop yet). function_call() (functions.c) checks this BEFORE
+ * recursing further, so a runaway recursive function gets a clean
+ * "recursion too deep" error instead of silently exhausting the
+ * real C call stack and segfaulting -- env_push_positional_params()'s
+ * own cap only protects ITS storage array, not the unbounded C
+ * recursion in function_call()/run_statements() that was still
+ * happening past that point before this check was added. */
+int env_get_call_depth(void) {
+    return positional_stack_depth;
+}
+
+void env_pop_positional_params(void) {
+    if (positional_stack_depth <= 0) {
+        return;
+    }
+    positional_stack_depth--;
+    int n = positional_count_stack[positional_stack_depth];
+    for (int i = 0; i < n; i++) {
+        free(positional_stack[positional_stack_depth][i]);
+    }
+}
+
 char *env_expand(const char *word) {
     /* Strip the QUOTED_FIRST marker (if present) and remember whether
      * it was there -- it tells us the word's first character came
@@ -89,6 +145,33 @@ char *env_expand(const char *word) {
                 continue;
             }
 
+            if (*p == '`' && !in_single_quotes) {
+                /* `cmd` -- old-style command substitution: everything up
+                 * to the next backtick is the inner command */
+                const char *inner_start = p + 1;
+                const char *inner_end = strchr(inner_start, '`');
+                if (inner_end != NULL) {
+                    size_t inner_len = (size_t)(inner_end - inner_start);
+                    char *inner = malloc(inner_len + 1);
+                    if (inner != NULL) {
+                        memcpy(inner, inner_start, inner_len);
+                        inner[inner_len] = '\0';
+                        char *result = command_substitute(inner);
+                        free(inner);
+                        if (result != NULL) {
+                            size_t vlen = strlen(result);
+                            while (len + vlen + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+                            memcpy(out + len, result, vlen);
+                            len += vlen;
+                            free(result);
+                        }
+                    }
+                    p = inner_end + 1;
+                    continue;
+                }
+                /* no closing backtick: fall through and copy it literally */
+            }
+
             if (*p != '$' || in_single_quotes) {
                 if (len + 1 >= cap) {
                     cap *= 2;
@@ -99,6 +182,113 @@ char *env_expand(const char *word) {
             }
 
             /* *p == '$' and we are NOT inside single quotes */
+
+            if (*(p + 1) == '(') {
+                /* $(cmd) -- find the matching ')' by depth-counting, so a
+                 * nested $(...) inside the command is included whole, and
+                 * skipping over quoted text so a ')' inside quotes is not
+                 * mistaken for the closer. */
+                const char *inner_start = p + 2;
+                const char *q = inner_start;
+                int depth = 1;
+                char in_q = '\0';
+                while (*q != '\0') {
+                    if (in_q != '\0') {
+                        if (*q == in_q) in_q = '\0';
+                    } else if (*q == '\'' || *q == '"') {
+                        in_q = *q;
+                    } else if (*q == '(') {
+                        depth++;
+                    } else if (*q == ')') {
+                        depth--;
+                        if (depth == 0) break;
+                    }
+                    q++;
+                }
+                if (*q == ')') {
+                    size_t inner_len = (size_t)(q - inner_start);
+                    char *inner = malloc(inner_len + 1);
+                    if (inner != NULL) {
+                        memcpy(inner, inner_start, inner_len);
+                        inner[inner_len] = '\0';
+                        char *result = command_substitute(inner);
+                        free(inner);
+                        if (result != NULL) {
+                            size_t vlen = strlen(result);
+                            while (len + vlen + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+                            memcpy(out + len, result, vlen);
+                            len += vlen;
+                            free(result);
+                        }
+                    }
+                    p = q + 1;
+                    continue;
+                }
+                /* unterminated: the tokenizer already reported this, so
+                 * just fall through and treat the '$' literally */
+            }
+            if (*(p + 1) >= '1' && *(p + 1) <= '9') {
+                /* $1..$9 -- positional parameter from the innermost
+                 * currently-executing function call (see the positional
+                 * parameter stack above). Outside any function call, or
+                 * for an index beyond how many arguments were passed,
+                 * this expands to empty string, matching POSIX (an unset
+                 * parameter is simply empty, not an error). */
+                int idx = *(p + 1) - '1'; /* $1 -> index 0 */
+                p += 2;
+                if (positional_stack_depth > 0) {
+                    int top = positional_stack_depth - 1;
+                    if (idx < positional_count_stack[top]) {
+                        const char *val = positional_stack[top][idx];
+                        size_t vlen = strlen(val);
+                        while (len + vlen + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+                        memcpy(out + len, val, vlen);
+                        len += vlen;
+                    }
+                }
+                continue;
+            }
+
+            if (*(p + 1) == '#') {
+                /* $# -- number of positional parameters passed to the
+                 * innermost currently-executing function call. */
+                p += 2;
+                int count = (positional_stack_depth > 0)
+                ? positional_count_stack[positional_stack_depth - 1] : 0;
+                char count_str[16];
+                int count_len = snprintf(count_str, sizeof(count_str), "%d", count);
+                if (count_len > 0) {
+                    size_t vlen = (size_t)count_len;
+                    while (len + vlen + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+                    memcpy(out + len, count_str, vlen);
+                    len += vlen;
+                }
+                continue;
+            }
+
+            if (*(p + 1) == '@') {
+                /* $@ -- all positional parameters, space-separated. (A
+                 * simplification vs full POSIX, where "$@" inside double
+                 * quotes expands to separate individually-quoted words;
+                 * acsh always joins them with a single space here.) */
+                p += 2;
+                if (positional_stack_depth > 0) {
+                    int top = positional_stack_depth - 1;
+                    int count = positional_count_stack[top];
+                    for (int i = 0; i < count; i++) {
+                        if (i > 0) {
+                            if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+                            out[len++] = ' ';
+                        }
+                        const char *val = positional_stack[top][i];
+                        size_t vlen = strlen(val);
+                        while (len + vlen + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+                        memcpy(out + len, val, vlen);
+                        len += vlen;
+                    }
+                }
+                continue;
+            }
 
             if (*(p + 1) == '?') {
                 /* $? -- exit status of the last completed pipeline. Kept

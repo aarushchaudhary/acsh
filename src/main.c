@@ -76,6 +76,21 @@ static void run_line(char *line, int record_history) {
         env_set_last_status(status);
         return;
     }
+    if (is_for_statement(line)) {
+        int status = run_for_statement(line, read_more_line_from_current_source);
+        env_set_last_status(status);
+        return;
+    }
+    if (is_case_statement(line)) {
+        int status = run_case_statement(line, read_more_line_from_current_source);
+        env_set_last_status(status);
+        return;
+    }
+    if (is_function_definition(line)) {
+        int status = run_function_definition(line, read_more_line_from_current_source);
+        env_set_last_status(status);
+        return;
+    }
 
     Chain ch;
     if (parse_chain(line, &ch) != 0) {

@@ -217,9 +217,42 @@ static int builtin_source(Command *cmd) {
     return (run_script_file(cmd->argv[1]) == 0) ? 0 : 1;
 }
 
+static int builtin_break_or_continue(Command *cmd, int is_continue) {
+    if (control_flow_in_loop_depth() <= 0) {
+        /* Matches real shells: not inside any loop is a warning, not
+         * a hard error -- the shell keeps running normally. */
+        fprintf(stderr, "acsh: %s: only meaningful inside a loop\n",
+                is_continue ? "continue" : "break");
+        return 0;
+    }
+
+    int level = 1;
+    if (cmd->argc > 1) {
+        level = atoi(cmd->argv[1]);
+        if (level < 1) level = 1;
+    }
+
+    control_flow_signal_loop(is_continue, level);
+    return 0;
+}
+
 int try_run_builtin(Command *cmd, int *exit_status) {
     if (cmd->argc == 0 || cmd->argv[0] == NULL) {
         return 0;
+    }
+
+    if (strcmp(cmd->argv[0], "break") == 0) {
+        *exit_status = builtin_break_or_continue(cmd, /*is_continue=*/0);
+        return 1;
+    }
+    if (strcmp(cmd->argv[0], "continue") == 0) {
+        *exit_status = builtin_break_or_continue(cmd, /*is_continue=*/1);
+        return 1;
+    }
+
+    if (strcmp(cmd->argv[0], "test") == 0 || strcmp(cmd->argv[0], "[") == 0) {
+        *exit_status = builtin_test(cmd);
+        return 1;
     }
 
     if (strcmp(cmd->argv[0], "cd") == 0) {

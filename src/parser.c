@@ -48,6 +48,75 @@
 
 #define MAX_TOKENS 256
 
+/* If *pp points at the start of a command substitution -- either
+ * "$(" ... matching ")" or a backtick pair -- copies that ENTIRE
+ * region verbatim (parentheses/backticks included) into buf at *plen,
+ * advances *pp past it, and returns 1. Returns 0 (touching nothing)
+ * if *pp isn't at such a region. Returns -1 on an unterminated
+ * substitution (error already printed) or a too-long word.
+ *
+ * Keeping the region verbatim is what lets env_expand() find and run
+ * it later: tokenizing must not split on the spaces/pipes/semicolons
+ * INSIDE the substitution (e.g. echo $(ls | wc -l) is one word with
+ * respect to the outer command), so the whole region is treated as an
+ * indivisible part of the surrounding word here. Parentheses are
+ * depth-counted so nested $( ... $(...) ... ) works, and quotes
+ * inside are tracked so a ')' inside quotes doesn't end it early. */
+static int copy_command_substitution(char **pp, char *buf, size_t *plen, size_t bufsize) {
+    char *p = *pp;
+    size_t len = *plen;
+
+    if (p[0] == '$' && p[1] == '(') {
+        int depth = 1;
+        char in_quote = '\0';
+        if (len + 2 >= bufsize) return -1;
+        buf[len++] = *p++; /* '$' */
+        buf[len++] = *p++; /* '(' */
+        while (*p != '\0') {
+            if (in_quote != '\0') {
+                if (*p == in_quote) in_quote = '\0';
+            } else if (*p == '\'' || *p == '"') {
+                in_quote = *p;
+            } else if (*p == '(') {
+                depth++;
+            } else if (*p == ')') {
+                depth--;
+                if (depth == 0) {
+                    if (len + 1 >= bufsize) return -1;
+                    buf[len++] = *p++; /* closing ')' */
+                    *pp = p;
+                    *plen = len;
+                    return 1;
+                }
+            }
+            if (len + 1 >= bufsize) return -1;
+            buf[len++] = *p++;
+        }
+        fprintf(stderr, "acsh: syntax error: unterminated $(\n");
+        return -1;
+    }
+
+    if (p[0] == '`') {
+        if (len + 1 >= bufsize) return -1;
+        buf[len++] = *p++; /* opening backtick */
+        while (*p != '\0' && *p != '`') {
+            if (len + 1 >= bufsize) return -1;
+            buf[len++] = *p++;
+        }
+        if (*p != '`') {
+            fprintf(stderr, "acsh: syntax error: unterminated `\n");
+            return -1;
+        }
+        if (len + 1 >= bufsize) return -1;
+        buf[len++] = *p++; /* closing backtick */
+        *pp = p;
+        *plen = len;
+        return 1;
+    }
+
+    return 0;
+}
+
 /* Reads one "word" token starting at *pp (which may begin mid-word,
  * with quotes and unquoted segments mixed). Appends the decoded
  * characters into buf. Returns 0 on success, -1 on an unterminated
@@ -95,10 +164,15 @@ static int read_word(char **pp, char *buf, size_t bufsize) {
                         if (len + 1 >= bufsize) goto too_long;
                         buf[len++] = p[1];
                         p += 2;
-                    } else {
-                        if (len + 1 >= bufsize) goto too_long;
-                        buf[len++] = *p++;
+                        continue;
                     }
+                    {
+                        int sub = copy_command_substitution(&p, buf, &len, bufsize);
+                        if (sub < 0) return -1;
+                        if (sub == 1) continue;
+                    }
+                    if (len + 1 >= bufsize) goto too_long;
+                    buf[len++] = *p++;
                 }
                 if (*p != '"') {
                     fprintf(stderr, "acsh: syntax error: unterminated \"\n");
@@ -115,6 +189,15 @@ static int read_word(char **pp, char *buf, size_t bufsize) {
                 buf[len++] = p[1];
                 p += 2;
                 continue;
+            }
+
+            {
+                int sub = copy_command_substitution(&p, buf, &len, bufsize);
+                if (sub < 0) return -1;
+                if (sub == 1) {
+                    is_first_char = 0;
+                    continue;
+                }
             }
 
             if (len + 1 >= bufsize) goto too_long;
@@ -313,6 +396,8 @@ int parse_chain(const char *line, Chain *ch) {
     const char *seg_start = line;
     const char *p = line;
     char in_quote = '\0'; /* '\0' = not in a quote, else the quote char */
+    int subst_depth = 0;  /* nesting depth of $( ... ) command substitutions */
+    int in_backtick = 0;  /* inside a `...` command substitution */
 
     while (1) {
         int is_end_of_line = (*p == '\0');
@@ -321,14 +406,28 @@ int parse_chain(const char *line, Chain *ch) {
         int consume = 0; /* how many chars the operator itself takes */
 
         if (!is_end_of_line && in_quote == '\0') {
-            if (*p == '\'' || *p == '"') {
+            if (*p == '`') {
+                in_backtick = !in_backtick;
+            } else if (*p == '$' && p[1] == '(') {
+                subst_depth++;
+                p++; /* step onto the '(' so it isn't counted twice below */
+            } else if (*p == ')' && subst_depth > 0) {
+                subst_depth--;
+            } else if (subst_depth == 0 && !in_backtick) {
+                /* only look for chain operators OUTSIDE any command
+                 * substitution -- a ; or && inside $(...) belongs to
+                 * the inner command, not to this line's own chain */
+                if (*p == '\'' || *p == '"') {
+                    in_quote = *p;
+                } else if (*p == '&' && p[1] == '&') {
+                    split_here = 1; op = CHAIN_AND; consume = 2;
+                } else if (*p == '|' && p[1] == '|') {
+                    split_here = 1; op = CHAIN_OR; consume = 2;
+                } else if (*p == ';') {
+                    split_here = 1; op = CHAIN_SEQ; consume = 1;
+                }
+            } else if (*p == '\'' || *p == '"') {
                 in_quote = *p;
-            } else if (*p == '&' && p[1] == '&') {
-                split_here = 1; op = CHAIN_AND; consume = 2;
-            } else if (*p == '|' && p[1] == '|') {
-                split_here = 1; op = CHAIN_OR; consume = 2;
-            } else if (*p == ';') {
-                split_here = 1; op = CHAIN_SEQ; consume = 1;
             }
         } else if (!is_end_of_line && in_quote != '\0') {
             if (*p == in_quote) {
@@ -385,4 +484,18 @@ int parse_chain(const char *line, Chain *ch) {
     }
 
     return 0;
+}
+
+void pipeline_free(Pipeline *pl) {
+    for (int i = 0; i < pl->num_cmds; i++) {
+        Command *c = &pl->cmds[i];
+        for (int a = 0; a < c->argc; a++) {
+            free(c->argv[a]);
+            c->argv[a] = NULL;
+        }
+        free(c->infile);
+        c->infile = NULL;
+        free(c->outfile);
+        c->outfile = NULL;
+    }
 }

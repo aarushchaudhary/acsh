@@ -37,11 +37,19 @@ static void apply_redirection(Command *cmd) {
 /* Child processes must reset the signal handling they inherited from
  * the shell: SIGINT/SIGTSTP go back to default (SIG_DFL) so Ctrl+C
  * actually kills the running program instead of being ignored/rerouted
- * like it is in the shell itself. */
+ * like it is in the shell itself. SIGCHLD's blocked status must also
+ * be cleared here: execute_pipeline() blocks SIGCHLD in the PARENT
+ * from before this fork() happens (to avoid a real race explained at
+ * that call site), and fork() copies the parent's blocked-signal mask
+ * into the child -- so without this, every external program acsh
+ * runs would inherit SIGCHLD blocked, which would break any of THEM
+ * that forks its own children and expects to receive their SIGCHLD
+ * normally (e.g. running another shell, or a build tool, inside acsh). */
 static void reset_child_signals(void) {
     signal(SIGINT, SIG_DFL);
     signal(SIGTSTP, SIG_DFL);
     signal(SIGCHLD, SIG_DFL);
+    unblock_sigchld();
 }
 
 /* Converts a raw wait() status into a shell-style exit code: normal
@@ -58,22 +66,121 @@ static int status_to_exit_code(int status) {
     return 0;
 }
 
+/* Returns 1 if `word` has the form NAME=value, where NAME is a valid
+ * shell variable name (starts with a letter or underscore, then
+ * letters/digits/underscores). This is how POSIX distinguishes an
+ * assignment word from an ordinary command argument. */
+static int is_assignment_word(const char *word) {
+    if (!((word[0] >= 'A' && word[0] <= 'Z') ||
+        (word[0] >= 'a' && word[0] <= 'z') || word[0] == '_')) {
+        return 0;
+        }
+        size_t i = 1;
+    while ((word[i] >= 'A' && word[i] <= 'Z') || (word[i] >= 'a' && word[i] <= 'z') ||
+        (word[i] >= '0' && word[i] <= '9') || word[i] == '_') {
+        i++;
+        }
+        return word[i] == '=';
+}
+
+/* Applies a NAME=value word by setting the variable in the process
+ * environment (acsh's single variable store -- see the design note in
+ * acsh.h next to env_expand). */
+static void apply_assignment(const char *word) {
+    const char *eq = strchr(word, '=');
+    size_t name_len = (size_t)(eq - word);
+    char name[256];
+    if (name_len >= sizeof(name)) {
+        fprintf(stderr, "acsh: variable name too long\n");
+        return;
+    }
+    memcpy(name, word, name_len);
+    name[name_len] = '\0';
+    setenv(name, eq + 1, 1);
+}
+
 int execute_pipeline(Pipeline *pl) {
     int n = pl->num_cmds;
 
-    /* Single command, no pipe: check builtins first. Builtins must run
-     * in the parent process itself (e.g. `cd` has to change the
-     * shell's own working directory, not a child's). */
+    /* Leading NAME=value words on a single command are assignments.
+     * If they are the ONLY words (`x=5`), the line is just an
+     * assignment and no command runs -- status is 0, or the status of
+     * a command substitution in the value, which POSIX says a pure
+     * assignment line reports (e.g. `x=$(false)` yields status 1).
+     * If a command follows (`x=5 somecmd`), POSIX scopes the
+     * assignment to that one command; acsh simplifies this to a
+     * normal persistent assignment, noted as a known limitation. */
+    if (n == 1) {
+        Command *c = &pl->cmds[0];
+        int skip = 0;
+        while (skip < c->argc && is_assignment_word(c->argv[skip])) {
+            apply_assignment(c->argv[skip]);
+            skip++;
+        }
+        if (skip > 0) {
+            if (skip == c->argc) {
+                /* A pure assignment reports status 0 per POSIX -- unless
+                 * a value contained a command substitution, in which
+                 * case the status of THAT substitution (already
+                 * recorded in $? when it ran during expansion) is what
+                 * the line reports. Checking the raw text for a
+                 * substitution marker tells the two cases apart;
+                 * otherwise env_get_last_status() would leak in the
+                 * PREVIOUS command's status (e.g. `false; x=5` wrongly
+                 * reporting 1). */
+                if (strstr(pl->raw_line, "$(") != NULL ||
+                    strchr(pl->raw_line, '`') != NULL) {
+                    return env_get_last_status();
+                    }
+                    return 0;
+            }
+            /* shift the remaining words down so the command is argv[0] */
+            for (int i = skip; i <= c->argc; i++) {
+                c->argv[i - skip] = c->argv[i];
+            }
+            c->argc -= skip;
+        }
+    }
+
+    /* Single command, no pipe: check builtins first, then user-defined
+     * functions. Both run in the parent process itself, not a forked
+     * child -- for builtins this is required (e.g. `cd` must change
+     * the shell's own directory); for functions it matters because a
+     * function's `export`/variable assignments should affect the
+     * calling shell's environment, exactly like a builtin's would,
+     * not vanish when a child process exits. A function called as
+     * part of a PIPELINE (n > 1) is a known scope limitation --
+     * acsh does not support that; only standalone function calls do. */
     if (n == 1) {
         int exit_status = 0;
         if (try_run_builtin(&pl->cmds[0], &exit_status)) {
             return exit_status;
+        }
+        if (function_is_defined(pl->cmds[0].argv[0])) {
+            return function_call(pl->cmds[0].argc, pl->cmds[0].argv);
         }
     }
 
     int prev_read_fd = -1;      /* read end of the previous pipe, or -1 */
     pid_t pids[ACSH_MAX_CMDS];
     pid_t pgid = 0;             /* process group ID for this whole pipeline */
+
+    /* SIGCHLD is blocked from BEFORE the first fork() all the way
+     * through the wait loop below (unblocked again once background-
+     * or wait-handling is fully done for this pipeline). This closes
+     * a real race that the previous version of this fix (blocking
+     * only around the wait loop itself) still had: a fast-exiting
+     * child -- e.g. `false`, which exits almost immediately -- can
+     * deliver SIGCHLD and be reaped by the async sigchld_handler
+     * BEFORE this function ever reaches its own waitpid() call,
+     * making that waitpid() immediately fail with ECHILD and silently
+     * report exit status 0 instead of the child's real status. This
+     * was hard to catch because it's nondeterministic (depends on
+     * exactly how fast the child exits relative to scheduling), and
+     * it was hit specifically via command substitution (subst.c),
+     * where each substitution runs its own pipeline in a fresh forked
+     * subshell -- `$(false)` intermittently reported status 0. */
+    block_sigchld();
 
     for (int i = 0; i < n; i++) {
         Command *cmd = &pl->cmds[i];
@@ -83,6 +190,7 @@ int execute_pipeline(Pipeline *pl) {
         if (have_next) {
             if (pipe(pipefd) < 0) {
                 perror("acsh: pipe");
+                unblock_sigchld();
                 return 1;
             }
         }
@@ -90,6 +198,7 @@ int execute_pipeline(Pipeline *pl) {
         pid_t pid = fork();
         if (pid < 0) {
             perror("acsh: fork");
+            unblock_sigchld();
             return 1;
         }
 
@@ -148,9 +257,11 @@ int execute_pipeline(Pipeline *pl) {
     if (pl->background) {
         int job_id = jobs_add(pgid, pids, n, pl->raw_line);
         printf("[%d] %d\n", job_id, pgid);
-        /* do NOT wait -- shell returns to the prompt immediately;
-         * SIGCHLD handler in signals.c reaps it whenever it finishes.
-         * A backgrounded pipeline has no exit status to report yet,
+        /* unblock before returning: a backgrounded pipeline's own
+         * SIGCHLD (whenever it finishes) must reach the async handler
+         * normally, since nothing else will ever wait() for it */
+        unblock_sigchld();
+        /* A backgrounded pipeline has no exit status to report yet,
          * so &&/||/; after it always treat it as success (POSIX's
          * behaviour for `cmd &` is exactly this: $? is 0 right away). */
         return 0;
@@ -162,11 +273,11 @@ int execute_pipeline(Pipeline *pl) {
      * pipeline's overall status in POSIX is the last stage's status
      * (e.g. `false | true` "succeeds" even though `false` failed).
      *
-     * SIGCHLD is blocked for the duration of this wait loop to avoid
-     * a race with the async sigchld_handler (see block_sigchld()'s
-     * comment in signals.c for the full explanation). */
+     * SIGCHLD has already been blocked since before this pipeline's
+     * first fork() (see the comment above that block_sigchld() call),
+     * so no child of this pipeline can be reaped out from under the
+     * explicit waitpid() loop below. */
     set_foreground_pgid(pgid);
-    block_sigchld();
 
     int status = 0;
     int last_exit_code = 0;
@@ -242,5 +353,6 @@ void execute_chain(Chain *ch) {
 
         status = execute_pipeline(&pl);
         env_set_last_status(status);
+        pipeline_free(&pl);
     }
 }

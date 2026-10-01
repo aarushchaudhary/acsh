@@ -9,6 +9,9 @@
 #define ACSH_MAX_ALIASES   32     /* max number of aliases stored       */
 #define ACSH_MAX_JOBS      32     /* max number of tracked background/stopped jobs */
 #define ACSH_MAX_LOOP_ITERATIONS 10000  /* safety cap against runaway while/until loops */
+#define ACSH_MAX_FUNCTIONS 64      /* max number of defined shell functions */
+#define ACSH_MAX_POSITIONAL_PARAMS 32  /* max $1, $2, ... args per function call */
+#define ACSH_MAX_CALL_DEPTH 64     /* max nested function calls (recursion limit) */
 
 typedef enum {
     JOB_RUNNING,
@@ -95,6 +98,17 @@ typedef struct {
  * success, -1 on a parse error (message already printed). */
 int parse_line(char *line, Pipeline *pl);
 
+/* Frees every heap-allocated field inside `pl` (each Command's argv[]
+ * entries, infile, outfile) that parse_line()/env_expand()/
+ * glob_expand() allocated while building it -- does NOT free `pl`
+ * itself, since Pipeline is always stack-allocated by callers. Must
+ * be called exactly once after a Pipeline returned by parse_line() is
+ * done being used (i.e. after execute_pipeline() returns), or those
+ * allocations leak for the lifetime of the shell process. Safe to
+ * call on an all-zero (memset'd but never parsed) Pipeline -- every
+ * field it would free is NULL in that case. */
+void pipeline_free(Pipeline *pl);
+
 /* Splits a raw input line on unquoted &&, ||, and ; into raw text
  * segments (NOT yet parsed into Pipelines -- see the Chain struct's
  * comment for why). Returns 0 on success, -1 on a syntax error (e.g.
@@ -119,6 +133,9 @@ void execute_chain(Chain *ch);
 /* Builtin dispatch: returns 1 and runs the builtin if cmd->argv[0] is
  * one of acsh's builtins, otherwise returns 0 and does nothing. */
 int try_run_builtin(Command *cmd, int *exit_status);
+
+/* ---- test_builtin.c: POSIX test / [ ---- */
+int builtin_test(Command *cmd);
 
 /* ---- jobs.c: background/stopped job table ---- */
 
@@ -193,6 +210,20 @@ void env_set_last_status(int status);
  * without re-parsing "$?" as text. */
 int env_get_last_status(void);
 
+/* Pushes/pops a function call's positional parameters ($1, $2, ...,
+ * $#, $@), so env_expand() can resolve them for whichever function
+ * call is currently innermost. Called by functions.c around each
+ * function invocation; a stack (not a single global set) so nested
+ * and recursive function calls each see their own parameters. */
+void env_push_positional_params(int argc, char *argv[]);
+void env_pop_positional_params(void);
+
+/* Returns how many function calls are currently nested. Used by
+ * function_call() to refuse further recursion once ACSH_MAX_CALL_DEPTH
+ * is reached, rather than letting runaway recursion exhaust the real
+ * C stack and segfault. */
+int env_get_call_depth(void);
+
 /* ---- glob.c: pathname expansion (*, ?, [abc]) ----
  *
  * A word containing an unquoted glob metacharacter (*, ?, [) is
@@ -244,6 +275,12 @@ int is_if_statement(const char *line);
 int is_while_statement(const char *line);
 int is_until_statement(const char *line);
 
+/* Same idea, for for-loops (for VAR in WORD...; do BODY; done). */
+int is_for_statement(const char *line);
+
+/* Same idea, for case statements (case WORD in PATTERN) BODY;; esac). */
+int is_case_statement(const char *line);
+
 /* Runs a full if/then/elif/else/fi construct. `first_line` is the
  * line that already matched is_if_statement(). If the construct isn't
  * fully closed within first_line (the common, multi-line script
@@ -268,6 +305,43 @@ int run_if_statement(const char *first_line,
  * against an unintentional infinite loop hanging the whole shell. */
 int run_loop_statement(const char *first_line, int is_until,
                        char *(*read_more_line)(char *buf, int size));
+
+/* Runs a full for VAR in WORD...; do BODY; done loop construct.
+ * `first_line` is the line that already matched is_for_statement().
+ * Each WORD is $VAR/glob-expanded exactly like a normal command
+ * argument, and the loop body runs once per resulting word with VAR
+ * set to that value via the process environment (so $VAR reads it
+ * like any other variable). VAR's previous value (or absence) is
+ * restored once the loop finishes, matching POSIX scoping. */
+int run_for_statement(const char *first_line,
+                      char *(*read_more_line)(char *buf, int size));
+
+/* Runs a full case WORD in PATTERN1) BODY1 ;; ... esac construct.
+ * `first_line` is the line that already matched is_case_statement().
+ * The subject word and each pattern are $VAR-expanded; patterns
+ * support POSIX glob-style metacharacters (*, ?, [abc]) via fnmatch(),
+ * and multiple patterns per clause may be separated by '|'. Only the
+ * first matching clause's body runs (no fallthrough between clauses).
+ * Returns that body's exit status, or 0 if no clause matched. */
+int run_case_statement(const char *first_line,
+                       char *(*read_more_line)(char *buf, int size));
+
+/* Public entry point onto control_flow.c's internal statement-running
+ * engine, exposed specifically so functions.c can run a called
+ * function's body through the exact same machinery if/while/for/case
+ * bodies already use. Not intended to be called from anywhere else. */
+int run_statements_entrypoint(const char *start, const char *end);
+
+/* Raises a pending break/continue signal, consumed by the nearest
+ * enclosing while/until/for loop(s) as run_statements() unwinds back
+ * up to them. `level` is the N in `break N`/`continue N` (pass 1 for
+ * a bare break/continue). Called by the break/continue builtins. */
+void control_flow_signal_loop(int is_continue, int level);
+
+/* Returns how many while/until/for loops are currently executing
+ * (nested depth), so the break/continue builtins can tell whether
+ * they were invoked outside of any loop at all. */
+int control_flow_in_loop_depth(void);
 
 /* ---- alias.c ----
  *
@@ -343,5 +417,58 @@ void history_print_all(void);
  * duplicating that logic. Returns 0 on success, -1 if the file
  * couldn't be opened (message already printed). */
 int run_script_file(const char *path);
+
+/* ---- subst.c: command substitution ($(cmd) and `cmd`) ---- */
+
+/* Runs `cmd` in a forked subshell and returns its captured stdout as
+ * a newly malloc'd string (caller frees) with trailing newlines
+ * stripped, per POSIX. Being a subshell, side effects inside the
+ * substitution (variable assignments, cd, ...) do not affect the
+ * calling shell. Also updates $? to the subshell's exit status. */
+char *command_substitute(const char *cmd);
+
+/* ---- functions.c: shell functions (name() { body }) ----
+ *
+ * A deliberately scoped subset: functions are stored as raw body
+ * text (the same way if/while/for/case bodies are handled -- see
+ * control_flow.c) and re-parsed/executed each time they're called,
+ * rather than compiled into any intermediate form. Positional
+ * parameters ($1, $2, ..., $#, $@) are supported inside a function
+ * body via a simple save/restore of the "current call's arguments"
+ * state around each call, so recursion and nested calls work
+ * correctly (each call gets its own parameter set, restored when it
+ * returns). Local variables (the `local` keyword) are NOT
+ * implemented -- a function's `export`/plain assignments affect the
+ * same global environment as everywhare else in acsh, matching how
+ * acsh already treats all variables (see env.c's design note). */
+
+/* Returns 1 if `line` looks like a function definition: `name() {`
+ * (the body's opening brace may be on this same line or, per common
+ * shell-script style, on a following line -- both are detected here
+ * by only requiring "name()" with optional whitespace before an
+ * (eventual) '{'; run_function_definition() below handles reading
+ * further lines if the '{' hasn't appeared yet). */
+int is_function_definition(const char *line);
+
+/* Reads and stores a complete function definition, accumulating
+ * further lines via `read_more_line` if needed until the matching
+ * closing '}' is found (mirroring how if/while/for/case accumulate
+ * multi-line constructs in control_flow.c). Returns 0 on success, 1
+ * on a syntax error (message already printed). */
+int run_function_definition(const char *first_line,
+                            char *(*read_more_line)(char *buf, int size));
+
+/* Returns 1 if `name` is a currently defined function. Checked by
+ * main.c's run_line() before falling through to ordinary command
+ * execution, so a call to a defined function takes priority over an
+ * external program of the same name (matching real shell precedence:
+ * functions before external commands, though after builtins/aliases). */
+int function_is_defined(const char *name);
+
+/* Calls the function named argv[0], passing argv[1..argc-1] as its
+ * positional parameters ($1, $2, ...). Returns the function body's
+ * exit status. Must only be called when function_is_defined(argv[0])
+ * is true. */
+int function_call(int argc, char *argv[]);
 
 #endif /* ACSH_H */
