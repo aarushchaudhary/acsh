@@ -66,6 +66,173 @@ void env_push_positional_params(int argc, char *argv[]) {
     positional_stack_depth++;
 }
 
+/* Local variables (the `local` builtin): each function call frame
+ * remembers which variable names it declared `local` and what that
+ * name's value was BEFORE the call shadowed it (or that it didn't
+ * exist at all), so env_pop_locals_frame() can restore the outer
+ * scope's view of those names exactly when the function returns --
+ * this is what makes `local x` behave like a real local variable
+ * rather than a permanent change to the global environment. Uses the
+ * same per-call-frame stack pattern as the positional parameter stack
+ * above, pushed/popped by functions.c around each call. */
+#define ACSH_MAX_LOCALS_PER_FRAME 32
+typedef struct {
+    char name[64];
+    char *prior_value;   /* NULL if the name was unset before shadowing */
+    int   had_prior_value;
+} LocalVarEntry;
+
+static LocalVarEntry locals_stack[ACSH_MAX_CALL_DEPTH][ACSH_MAX_LOCALS_PER_FRAME];
+static int           locals_count_stack[ACSH_MAX_CALL_DEPTH];
+
+/* Called by functions.c at the same time as env_push_positional_params,
+ * to start a fresh (empty) locals frame for the call about to run. */
+void env_push_locals_frame(void) {
+    /* positional_stack_depth has ALREADY been incremented by
+     * env_push_positional_params() by the time functions.c calls this
+     * (see the call order in functions.c), so the frame THIS call
+     * should use is positional_stack_depth - 1, matching how the
+     * positional parameter stack itself addresses its top frame. */
+    int frame = positional_stack_depth - 1;
+    if (frame >= 0 && frame < ACSH_MAX_CALL_DEPTH) {
+        locals_count_stack[frame] = 0;
+    }
+}
+
+/* Declares NAME as local to the CURRENT (innermost) function call,
+ * remembering its old value (or absence) if this is the first time
+ * THIS call has declared it local, then sets it to `value` (or
+ * leaves it unset if value is NULL, for a bare `local x` with no
+ * assignment). Implements the `local` builtin. Returns 0 on success,
+ * 1 if called outside any function call (matching real shells, which
+ * treat `local` outside a function as an error) or if this frame's
+ * local-variable table is full. */
+int env_declare_local(const char *name, const char *value) {
+    if (positional_stack_depth <= 0) {
+        return 1; /* not inside a function call */
+    }
+    int frame = positional_stack_depth - 1;
+
+    /* if this call already declared `name` local earlier, don't
+     * re-save its prior value a second time -- that would end up
+     * "restoring" to the WRONG thing (the value from between the two
+     * `local` declarations, not the true outer value) when the call
+     * returns */
+    for (int i = 0; i < locals_count_stack[frame]; i++) {
+        if (strcmp(locals_stack[frame][i].name, name) == 0) {
+            if (value != NULL) {
+                setenv(name, value, 1);
+            }
+            return 0;
+        }
+    }
+
+    if (locals_count_stack[frame] >= ACSH_MAX_LOCALS_PER_FRAME) {
+        return 1;
+    }
+
+    LocalVarEntry *entry = &locals_stack[frame][locals_count_stack[frame]];
+    strncpy(entry->name, name, sizeof(entry->name) - 1);
+    entry->name[sizeof(entry->name) - 1] = '\0';
+
+    const char *existing = getenv(name);
+    if (existing != NULL) {
+        entry->prior_value = strdup(existing);
+        entry->had_prior_value = 1;
+    } else {
+        entry->prior_value = NULL;
+        entry->had_prior_value = 0;
+    }
+    locals_count_stack[frame]++;
+
+    if (value != NULL) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name); /* bare `local x`: starts unset, not inheriting the outer value */
+    }
+
+    return 0;
+}
+
+/* Called by functions.c right before env_pop_positional_params(), to
+ * restore every name this call frame declared `local` back to its
+ * pre-call value (or unset it, if it had none). Must run BEFORE the
+ * positional parameter stack pops, since it reads positional_stack_depth
+ * to find which frame's locals to restore. */
+void env_pop_locals_frame(void) {
+    int frame = positional_stack_depth - 1;
+    if (frame < 0 || frame >= ACSH_MAX_CALL_DEPTH) {
+        return;
+    }
+    for (int i = 0; i < locals_count_stack[frame]; i++) {
+        LocalVarEntry *entry = &locals_stack[frame][i];
+        if (entry->had_prior_value) {
+            setenv(entry->name, entry->prior_value, 1);
+            free(entry->prior_value);
+        } else {
+            unsetenv(entry->name);
+        }
+        entry->prior_value = NULL;
+    }
+    locals_count_stack[frame] = 0;
+}
+
+/* Replaces the CURRENT (innermost) function call's positional
+ * parameters entirely with argv[0..argc-1], discarding whatever was
+ * there before. Implements `set -- ARG...`. Returns 0 on success, 1
+ * if there is no active function call to replace parameters for
+ * (acsh has no top-level/script positional parameters to set either,
+ * since it does not model being invoked with its own argv the way a
+ * script file would be). */
+int env_set_positional_params(int argc, char *argv[]) {
+    if (positional_stack_depth <= 0) {
+        return 1;
+    }
+    int top = positional_stack_depth - 1;
+
+    for (int i = 0; i < positional_count_stack[top]; i++) {
+        free(positional_stack[top][i]);
+    }
+
+    int n = argc;
+    if (n > ACSH_MAX_POSITIONAL_PARAMS) {
+        n = ACSH_MAX_POSITIONAL_PARAMS;
+    }
+    for (int i = 0; i < n; i++) {
+        positional_stack[top][i] = strdup(argv[i]);
+    }
+    positional_count_stack[top] = n;
+    return 0;
+}
+
+/* Shifts the CURRENT (innermost) function call's positional
+ * parameters left by `n` -- i.e. what was $((n+1)) becomes the new
+ * $1, and so on, with the first n parameters discarded. Implements
+ * the `shift` builtin. Returns 0 on success, 1 if n is larger than
+ * the number of parameters currently available (matching POSIX,
+ * which treats shifting past the end as an error) or if called
+ * outside any function call (no positional parameters to shift at
+ * all -- acsh's top level has none, unlike a script invoked with its
+ * own argv, which acsh does not model). */
+int env_shift_positional_params(int n) {
+    if (positional_stack_depth <= 0) {
+        return 1;
+    }
+    int top = positional_stack_depth - 1;
+    int count = positional_count_stack[top];
+    if (n < 0 || n > count) {
+        return 1;
+    }
+    for (int i = 0; i < n; i++) {
+        free(positional_stack[top][i]);
+    }
+    for (int i = 0; i < count - n; i++) {
+        positional_stack[top][i] = positional_stack[top][i + n];
+    }
+    positional_count_stack[top] = count - n;
+    return 0;
+}
+
 /* Reports how many function calls are currently nested (i.e. how many
  * frames env_push_positional_params() has pushed without a matching
  * pop yet). function_call() (functions.c) checks this BEFORE

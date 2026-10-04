@@ -173,8 +173,19 @@ int main(void) {
             break;
         }
 
+        /* A SIGINT that arrived while idle at the prompt (handled by
+         * sigint_handler in signals.c) only sets a flag there, since
+         * running shell code directly inside a signal handler isn't
+         * safe. Check and act on it here, in ordinary execution
+         * context, right after the blocking fgets() that would have
+         * been interrupted returns. */
+        if (trap_check_and_run_int()) {
+            continue; /* re-prompt; whatever was on `line` is stale/empty */
+        }
+
         run_line(line, /*record_history=*/1);
     }
 
+    trap_run_exit();
     return 0;
 }

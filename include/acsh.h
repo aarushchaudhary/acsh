@@ -183,6 +183,30 @@ void set_foreground_pgid(pid_t pgid);
 void block_sigchld(void);
 void unblock_sigchld(void);
 
+/* ---- trap support (also in signals.c) ----
+ *
+ * acsh implements `trap` for exactly two cases: INT (Ctrl+C at the
+ * prompt) and EXIT (run once when the shell exits). Full POSIX trap
+ * supports every signal name/number and several pseudo-signals; this
+ * scope covers the two genuinely common interactive/script uses
+ * (intercepting Ctrl+C, registering cleanup-on-exit) without building
+ * out a general signal-name-to-number table and per-signal handler
+ * installation machinery for signals acsh doesn't otherwise manage
+ * (it already has dedicated, more specific handling for SIGCHLD and
+ * SIGTSTP via job control, which `trap` does not touch). */
+
+void trap_set_int(const char *command);
+void trap_set_exit(const char *command);
+
+/* Checked by main.c's REPL loop between commands; runs the pending
+ * INT trap (if SIGINT arrived at the prompt since the last check) in
+ * ordinary, non-signal-handler context, which is required since
+ * running shell code directly from a signal handler is not safe. */
+int trap_check_and_run_int(void);
+
+/* Called once by main.c right before the shell exits. */
+void trap_run_exit(void);
+
 /* ---- env.c: variable expansion ----
  *
  * acsh keeps things simple: `export NAME=value` sets a real process
@@ -217,6 +241,24 @@ int env_get_last_status(void);
  * and recursive function calls each see their own parameters. */
 void env_push_positional_params(int argc, char *argv[]);
 void env_pop_positional_params(void);
+
+/* Shifts the current function call's positional parameters left by
+ * n (default 1). Returns 0 on success, 1 if n exceeds the number of
+ * parameters available or there is no active function call. */
+int env_shift_positional_params(int n);
+
+/* Replaces the current function call's positional parameters
+ * entirely with argv[0..argc-1]. Implements `set -- ARG...`. Returns
+ * 0 on success, 1 if there is no active function call. */
+int env_set_positional_params(int argc, char *argv[]);
+
+/* Local variables (the `local` builtin). Pushed/popped by functions.c
+ * around each function call, alongside the positional parameter
+ * stack. See the long design comment above env_declare_local()'s
+ * definition in env.c for how shadowing and restoration work. */
+void env_push_locals_frame(void);
+void env_pop_locals_frame(void);
+int  env_declare_local(const char *name, const char *value);
 
 /* Returns how many function calls are currently nested. Used by
  * function_call() to refuse further recursion once ACSH_MAX_CALL_DEPTH

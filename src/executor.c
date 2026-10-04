@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -227,7 +228,24 @@ int execute_pipeline(Pipeline *pl) {
             apply_redirection(cmd);
 
             execvp(cmd->argv[0], cmd->argv);
-            fprintf(stderr, "acsh: %s: command not found\n", cmd->argv[0]);
+            /* execvp only returns on failure -- errno tells us WHY,
+             * and giving the real reason (rather than one generic
+             * "command not found" for every case) is both more
+             * accurate and more actionable: a permissions problem and
+             * a genuine typo need different fixes. */
+            if (errno == ENOENT) {
+                fprintf(stderr, "acsh: %s: command not found\n", cmd->argv[0]);
+            } else if (errno == EACCES) {
+                fprintf(stderr, "acsh: %s: permission denied (found, but not executable -- "
+                "check file permissions or a missing #!/.../interpreter line)\n",
+                cmd->argv[0]);
+            } else if (errno == ENOEXEC) {
+                fprintf(stderr, "acsh: %s: cannot execute (not a valid executable -- "
+                "if this is a script, it may be missing its #!/bin/sh line)\n",
+                cmd->argv[0]);
+            } else {
+                fprintf(stderr, "acsh: %s: cannot execute: %s\n", cmd->argv[0], strerror(errno));
+            }
             _exit(127);
         }
 

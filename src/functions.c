@@ -217,9 +217,17 @@ int run_function_definition(const char *first_line,
                                 /* $1, $2, ... are the CALL'S ARGUMENTS, not including the function
                                  * name itself (argv[0]) -- e.g. `greet Alice 30` must set $1 to
                                  * "Alice", not to "greet". Pass argv+1 / argc-1 to the positional
-                                 * parameter stack accordingly. */
+                                 * parameter stack accordingly. env_push_locals_frame() must run
+                                 * AFTER env_push_positional_params(), since it addresses its
+                                 * frame using the same call-depth counter that function pushes. */
                                 env_push_positional_params(argc - 1, argv + 1);
+                                env_push_locals_frame();
+
                                 int status = run_statements_entrypoint(fn->body, fn->body + strlen(fn->body));
+
+                                /* locals must be restored BEFORE positional parameters pop, for
+                                 * the same frame-addressing reason noted above */
+                                env_pop_locals_frame();
                                 env_pop_positional_params();
 
                                 return status;

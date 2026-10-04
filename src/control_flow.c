@@ -621,7 +621,8 @@ static int run_if_block(const char *start, const char *end) {
         const char *kw;
         const char *then_pos = find_next_keyword(cursor, end, &kw);
         if (then_pos == NULL || strcmp(kw, "then") != 0) {
-            fprintf(stderr, "acsh: syntax error: expected 'then'\n");
+            fprintf(stderr, "acsh: syntax error: expected 'then' after the 'if' condition\n"
+            "  acsh: usage:  if CONDITION; then COMMANDS; fi\n");
             return 1;
         }
 
@@ -632,7 +633,8 @@ static int run_if_block(const char *start, const char *end) {
         const char *body_start = cursor;
         const char *stop = find_next_keyword(cursor, end, &kw);
         if (stop == NULL) {
-            fprintf(stderr, "acsh: syntax error: expected 'elif', 'else', or 'fi'\n");
+            fprintf(stderr, "acsh: syntax error: expected 'elif', 'else', or 'fi' to close this 'if'\n"
+            "  acsh: usage:  if COND; then COMMANDS; [elif COND; then COMMANDS;] [else COMMANDS;] fi\n");
             return 1;
         }
         const char *body_end = stop;
@@ -655,7 +657,8 @@ static int run_if_block(const char *start, const char *end) {
             const char *fi_kw;
             const char *fi_pos_local = find_next_keyword(cursor, end, &fi_kw);
             if (fi_pos_local == NULL || strcmp(fi_kw, "fi") != 0) {
-                fprintf(stderr, "acsh: syntax error: expected 'fi'\n");
+                fprintf(stderr, "acsh: syntax error: expected 'fi' to close this 'if ... else'\n"
+                "  acsh: usage:  if COND; then COMMANDS; else COMMANDS; fi\n");
                 return 1;
             }
             if (!executed_a_branch) {
@@ -695,7 +698,9 @@ static int run_loop_block(const char *start, const char *end, int is_until) {
     const char *kw;
     const char *do_pos = find_next_do_done(cursor, end, &kw);
     if (do_pos == NULL || strcmp(kw, "do") != 0) {
-        fprintf(stderr, "acsh: syntax error: expected 'do'\n");
+        fprintf(stderr, "acsh: syntax error: expected 'do' after the '%s' condition\n"
+        "  acsh: usage:  %s CONDITION; do COMMANDS; done\n",
+        opener_word, opener_word);
         return 1;
     }
 
@@ -706,7 +711,9 @@ static int run_loop_block(const char *start, const char *end, int is_until) {
     const char *done_kw;
     const char *done_pos = find_next_do_done(body_start, end, &done_kw);
     if (done_pos == NULL || strcmp(done_kw, "done") != 0) {
-        fprintf(stderr, "acsh: syntax error: expected 'done'\n");
+        fprintf(stderr, "acsh: syntax error: expected 'done' to close this '%s' loop\n"
+        "  acsh: usage:  %s CONDITION; do COMMANDS; done\n",
+        opener_word, opener_word);
         return 1;
     }
     const char *body_end = done_pos;
@@ -859,7 +866,9 @@ int run_loop_statement(const char *first_line, int is_until,
                            if (!(cursor + 2 <= end && word_matches(cursor, 2, "in") &&
                                (cursor + 2 == end || cursor[2] == ' ' || cursor[2] == '\t' ||
                                cursor[2] == '\n' || cursor[2] == ';'))) {
-                               fprintf(stderr, "acsh: syntax error: expected 'in' after 'for %s'\n", varname);
+                               fprintf(stderr, "acsh: syntax error: expected 'in' after 'for %s'\n"
+                               "  acsh: usage:  for %s in WORD...; do COMMANDS; done\n",
+                               varname, varname);
                            return 1;
                                }
                                cursor += 2;
@@ -871,7 +880,8 @@ int run_loop_statement(const char *first_line, int is_until,
                                const char *kw;
                                const char *do_pos = find_next_do_done(cursor, end, &kw);
                                if (do_pos == NULL || strcmp(kw, "do") != 0) {
-                                   fprintf(stderr, "acsh: syntax error: expected 'do'\n");
+                                   fprintf(stderr, "acsh: syntax error: expected 'do' after the 'for ... in' word list\n"
+                                   "  acsh: usage:  for %s in WORD...; do COMMANDS; done\n", varname);
                                    return 1;
                                }
                                const char *wordlist_start = cursor;
@@ -881,7 +891,8 @@ int run_loop_statement(const char *first_line, int is_until,
                                const char *done_kw;
                                const char *done_pos = find_next_do_done(body_start, end, &done_kw);
                                if (done_pos == NULL || strcmp(done_kw, "done") != 0) {
-                                   fprintf(stderr, "acsh: syntax error: expected 'done'\n");
+                                   fprintf(stderr, "acsh: syntax error: expected 'done' to close this 'for' loop\n"
+                                   "  acsh: usage:  for %s in WORD...; do COMMANDS; done\n", varname);
                                    return 1;
                                }
                                const char *body_end = done_pos;
@@ -1145,7 +1156,8 @@ int run_loop_statement(const char *first_line, int is_until,
                                                  if (!(cursor + 2 <= end && word_matches(cursor, 2, "in") &&
                                                      (cursor + 2 == end || cursor[2] == ' ' || cursor[2] == '\t' ||
                                                      cursor[2] == '\n' || cursor[2] == ';'))) {
-                                                     fprintf(stderr, "acsh: syntax error: expected 'in' after 'case %s'\n", raw_subject);
+                                                     fprintf(stderr, "acsh: syntax error: expected 'in' after 'case %s'\n"
+                                                     "  acsh: usage:  case WORD in PATTERN) COMMANDS ;; ... esac\n", raw_subject);
                                                  free(expanded_subject);
                                                  return 1;
                                                      }

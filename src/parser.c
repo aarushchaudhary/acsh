@@ -92,7 +92,8 @@ static int copy_command_substitution(char **pp, char *buf, size_t *plen, size_t 
             if (len + 1 >= bufsize) return -1;
             buf[len++] = *p++;
         }
-        fprintf(stderr, "acsh: syntax error: unterminated $(\n");
+        fprintf(stderr, "acsh: syntax error: no closing ')' found for '$('\n"
+        "  acsh: command substitution needs a matching ')': $(command)\n");
         return -1;
     }
 
@@ -104,7 +105,8 @@ static int copy_command_substitution(char **pp, char *buf, size_t *plen, size_t 
             buf[len++] = *p++;
         }
         if (*p != '`') {
-            fprintf(stderr, "acsh: syntax error: unterminated `\n");
+            fprintf(stderr, "acsh: syntax error: no closing '`' found\n"
+            "  acsh: backtick command substitution needs a matching closing `\n");
             return -1;
         }
         if (len + 1 >= bufsize) return -1;
@@ -145,7 +147,8 @@ static int read_word(char **pp, char *buf, size_t bufsize) {
                     buf[len++] = *p++;
                 }
                 if (*p != '\'') {
-                    fprintf(stderr, "acsh: syntax error: unterminated '\n");
+                    fprintf(stderr, "acsh: syntax error: no closing ' found\n"
+                    "  acsh: every ' must be matched by another ' later on the same line\n");
                     return -1;
                 }
                 if (len + 1 >= bufsize) goto too_long;
@@ -175,7 +178,8 @@ static int read_word(char **pp, char *buf, size_t bufsize) {
                     buf[len++] = *p++;
                 }
                 if (*p != '"') {
-                    fprintf(stderr, "acsh: syntax error: unterminated \"\n");
+                    fprintf(stderr, "acsh: syntax error: no closing \" found\n"
+                    "  acsh: every \" must be matched by another \" later on the same line\n");
                     return -1;
                 }
                 p++; /* skip closing quote */
@@ -479,7 +483,9 @@ int parse_chain(const char *line, Chain *ch) {
     }
 
     if (in_quote != '\0') {
-        fprintf(stderr, "acsh: syntax error: unterminated %c\n", in_quote);
+        fprintf(stderr, "acsh: syntax error: no closing %c found\n"
+        "  acsh: every %c must be matched by another %c later on the same line\n",
+        in_quote, in_quote, in_quote);
         return -1;
     }
 

@@ -1,115 +1,205 @@
 # acsh
 
-A lightweight POSIX shell written in C, designed as a friendlier drop-in for minimal environments like Alpine Linux. acsh implements ash's POSIX-compliant core faithfully, adds the specific interactive conveniences that Alpine users commonly miss, and explicitly does not chase bash's non-POSIX feature set — keeping a small footprint while closing the real usability gap.
+A POSIX-style command shell written in C, built to match BusyBox `ash`'s
+core behavior while fixing a specific set of usability gaps that Alpine
+Linux users have reported with `ash` in practice.
 
-## Why acsh
+acsh is **not** a bash clone and does not try to be. It targets `ash`'s
+feature set deliberately, and documents exactly where it goes further
+and exactly where it stops.
 
-Alpine Linux's default shell (`ash`) is minimal by design. The community consistently reports the same pain points:
+---
 
-- No default aliases (`ll`, `la`, etc.) out of the box
-- Switching shells leaves you with an empty, unhelpful rc file
-- No persistent command history
-- "Bare bones... charming, until it's annoying"
+## Building and running
 
-acsh fixes exactly these gaps without pulling in bash's bloat.
+No installation, no `chsh`, nothing touches your login shell. acsh is
+just a binary you compile and run.
 
-## Features
-
-**Core shell mechanics (matching ash)**
-- Interactive REPL with `acsh:path$` prompt showing current directory
-- Script execution (`./acsh script.sh`)
-- Pipelines (`cmd1 | cmd2 | cmd3`)
-- I/O redirection (`<`, `>`, `>>`)
-- Background execution (`&`) with job control (`jobs`, `fg`, `bg`)
-- `&&` / `||` / `;` chaining with correct exit-status propagation
-- Quoting: single quotes (literal), double quotes (`$VAR` expands), backslash escaping
-- Variable expansion (`$VAR`, `${VAR}`, `$?`, `~`)
-- Glob expansion (`*`, `?`, `[abc]`) — no match stays literal (POSIX)
-- Comments (`#`)
-- Signal handling: Ctrl+C/Ctrl+Z routed to foreground job, SIGCHLD reaping (no zombies)
-
-**Control flow**
-- `if` / `then` / `elif` / `else` / `fi` — single-line and multi-line, nested
-- `while COND; do BODY; done`
-- `until COND; do BODY; done`
-- `for VAR in word...; do BODY; done` *(in progress)*
-
-**Beyond ash — the additions**
-- Built-in default aliases: `ll`, `la`, `..`, `...`, `grep` (all overridable)
-- `~/.acshrc` startup file — sourced automatically; `config/acshrc.default` ships as a ready-to-use template
-- Persistent command history in `~/.acsh_history` (200 entries, dedup, survives restarts)
-- `source` / `.` builtin to re-source files interactively
-- `$?` special variable reflecting the last pipeline's exit status
-
-**Builtins**
-`cd`, `pwd`, `exit`, `export`, `unset`, `alias`, `unalias`, `history`, `jobs`, `fg`, `bg`, `source` / `.`
-
-## Build
-
-Requires gcc and a POSIX C11 environment (standard on any Linux system).
-
-```sh
+```bash
 make
+./acsh
 ```
 
-Produces the `acsh` binary in the project root. Nothing is installed.
+Requires only `gcc` and `make` — no external libraries, no package
+manager dependencies beyond a standard C toolchain and libc (tested
+against glibc; written to be portable to musl, Alpine's libc, since
+that's the actual target environment this project is framed around).
 
-```sh
-make clean
-```
+To get a sane set of default aliases and environment variables, copy
+the shipped template once:
 
-## Usage
-
-```sh
-./acsh            # interactive mode
-./acsh script.sh  # run a script
-```
-
-First run setup:
-
-```sh
+```bash
 cp config/acshrc.default ~/.acshrc
 ```
 
-This gives you sensible defaults (colored `ls`, the `l` alias, `EDITOR=vi`) and is itself a demonstration of what ash users have to set up manually after switching shells.
+---
 
-## Explicitly out of scope
-
-These are deliberate scope decisions, not accidental gaps:
-
-- Arrays / associative arrays
-- Brace expansion (`{1..10}`, `{a,b,c}`)
-- Tab completion
-- Process substitution (`<(cmd)`, `>(cmd)`)
-- `select` loops, coprocesses
-- `declare`/`typeset` attribute flags
-- Full readline-style line editing (Ctrl+R search, kill-ring)
-- `~username` tilde expansion (only bare `~` and `~/path`)
-- `break`/`continue` inside loops
-
-## Project structure
+## Project layout
 
 ```
 acsh/
 ├── Makefile
+├── README.md
 ├── config/
-│   └── acshrc.default
+│   └── acshrc.default      shipped ~/.acshrc template
 ├── include/
-│   └── acsh.h
+│   └── acsh.h               shared structs and the full module API
 └── src/
-    ├── main.c          # REPL, startup sequence, .acshrc loading
-    ├── parser.c        # tokenizer, quoting, $VAR/glob expansion, chain splitting
-    ├── executor.c      # fork/exec, pipelines, process groups, &&/||/; dispatch
-    ├── builtins.c      # all builtin commands
-    ├── jobs.c          # background/stopped job table
-    ├── signals.c       # SIGCHLD/SIGINT/SIGTSTP handlers
-    ├── env.c           # $VAR/$?/~ expansion
-    ├── alias.c         # alias table and line expansion
-    ├── history.c       # ring buffer + ~/.acsh_history persistence
-    ├── glob.c          # pathname expansion via POSIX glob()
-    └── control_flow.c  # if/while/until/for constructs
+    ├── main.c                REPL loop, startup sequence, trap wiring
+    ├── parser.c               tokenizer, quoting, expansion dispatch, chain splitting
+    ├── executor.c             fork/exec, pipes, redirection, job control, assignments
+    ├── builtins.c             cd, export, jobs, read, exec, type, command, local, set, trap, ...
+    ├── test_builtin.c         test / [ / [[ ]]
+    ├── control_flow.c         if/while/until/for/case, break/continue
+    ├── functions.c            shell function definitions and calls
+    ├── env.c                  $VAR expansion, $?, positional parameters, locals
+    ├── glob.c                 *, ?, [abc] pathname expansion
+    ├── subst.c                $(...) and `...` command substitution
+    ├── alias.c                alias table and line expansion
+    ├── history.c              persistent command history
+    ├── jobs.c                 background/stopped job table
+    └── signals.c              SIGCHLD/SIGINT/SIGTSTP handling, trap support
 ```
 
-## License
+---
 
-See [LICENSE](LICENSE).
+## What acsh implements
+
+**Core shell mechanics**
+- Pipelines (`|`), redirection (`<`, `>`, `>>`)
+- Sequencing and conditional chaining (`;`, `&&`, `||`)
+- Background execution (`&`) with real job control: process groups,
+  `jobs`/`fg`/`bg`, zombie-free `SIGCHLD` reaping
+- Quoting (`'...'`, `"..."`, `\`) with correct POSIX semantics —
+  including that `$` expands inside double quotes but not single quotes
+- Variable expansion (`$VAR`, `${VAR}`), tilde expansion, `$?`
+- Command substitution, `$(...)` and `` `...` ``, run in a true forked
+  subshell so side effects don't leak into the parent
+- Pathname expansion / globbing (`*`, `?`, `[abc]`)
+- Bare `NAME=value` assignments, including `x=$(cmd)` with correct
+  POSIX exit-status rules
+
+**Control flow**
+- `if` / `elif` / `else` / `fi`, including arbitrary nesting
+- `while`, `until`, `for ... in ...; do ... done`
+- `case ... in ... esac` with glob-style patterns and `|` alternation
+- `break [N]` / `continue [N]`, correctly scoped through nested loops
+  and through `if`/`case` bodies
+
+**Functions**
+- `name() { ... }` definitions, same-line or multi-line
+- `$1`...`$9`, `$#`, `$@` positional parameters
+- Real recursion, with a depth guard that fails cleanly instead of
+  crashing the shell
+
+**Builtins**
+```
+cd        exit      pwd       export    unset     alias     unalias
+jobs      fg        bg        history   source .  read      exec
+umask     type      command   shift     local     set       eval
+trap      break     continue  test  [   [[ ]]
+```
+
+---
+
+## What `ash` has that acsh does not
+
+These are real, acknowledged gaps — scoped out deliberately, not
+overlooked:
+
+| Missing | Notes |
+|---|---|
+| True arrays / associative arrays | Non-POSIX, bash-only in practice |
+| Brace expansion (`{1..10}`, `{a,b,c}`) | Non-POSIX convenience |
+| `getopts` | Not implemented |
+| Full `trap` signal table | acsh supports only `INT` and `EXIT` |
+| Full `set` option handling (`-e`, `-x`, ...) | Accepted but no-ops; only `set -- ARGS` has real effect |
+| `[[ ]]` regex matching (`=~`) | Not implemented; `[[ ]]` supports the same operators as `test` plus `==` |
+| Quoting inside a `for` word list | A quoted multi-word item incorrectly splits |
+| Tab-completion, readline-style line editing | No up-arrow history recall, no `Ctrl+R` |
+| `$RANDOM`, `$SECONDS`, `$BASHPID` | Not implemented |
+| Process substitution, `select`, `coproc` | Not implemented |
+
+---
+
+## What acsh has that `ash` does not
+
+This is acsh's actual reason to exist: a set of fixes aimed directly at
+**specific, sourced complaints** from the Alpine/BusyBox community about
+real friction points in `ash`, not a vague "more features" pitch.
+
+### 1. Default aliases
+`ash` ships with **zero** aliases out of the box — not even `ll`.
+acsh loads a small, overridable set at startup:
+```
+ll    -> ls -l
+la    -> ls -la
+..    -> cd ..
+...   -> cd ../..
+grep  -> grep --color=auto
+```
+
+### 2. A real, non-empty startup file
+On Alpine, switching to another shell commonly leaves you with an
+**empty** rc file, and `ash` itself doesn't read a startup file at all
+for non-login shells without manually setting `ENV` in `~/.profile`.
+acsh auto-loads `~/.acshrc` unconditionally, with a real shipped
+template (`config/acshrc.default`) that sets a few sane aliases and
+`$EDITOR` — no `ENV` workaround required.
+
+### 3. Persistent command history
+`ash` has no history file and no `history` command. acsh keeps a
+ring-buffer history in memory, persists it to `~/.acsh_history` as
+you type, reloads it on the next session, and exposes it via the
+`history` builtin.
+
+### 4. Clear, actionable syntax errors
+`ash` reports a bare `syntax error` with no further context. Every
+acsh control-flow error names what was expected **and** shows the
+correct syntax inline:
+```
+$ if true
+  echo oops
+  fi
+acsh: syntax error: expected 'then' after the 'if' condition
+  acsh: usage:  if CONDITION; then COMMANDS; fi
+```
+
+### 5. `[[ ]]` extended test
+BusyBox `ash` does not include `[[ ]]` at all. acsh supports it as a
+synonym for `test`/`[`, including `==` as an alias for `=`.
+
+### 6. More informative `type`
+acsh's `type` distinguishes and reports alias, shell function,
+builtin, or `$PATH` location in one line; `ash`'s is comparatively
+minimal.
+
+---
+
+## Known limitations (stated, not hidden)
+
+- `$@` joins arguments with plain spaces rather than preserving
+  per-word quoting
+- `x=5 somecommand` (a command-scoped temporary assignment) is
+  simplified to a normal persistent assignment
+- `trap`'s `INT` handling is polled between prompts in the interactive
+  loop; it is not re-checked inside a `source`d script mid-execution
+- There is a small, acceptable simplification in how `test`/`[[ ]]`
+  combine `-a`/`-o`: one level of combining is supported, not full
+  POSIX precedence chains across many operands (real shells document
+  this same ambiguity for deeply chained expressions)
+
+---
+
+## Development
+
+```bash
+make clean   # remove the built binary
+make         # rebuild
+```
+
+No install step, no Docker required. For anyone targeting the
+Alpine/musl environment specifically, building inside an Alpine
+container or VM with `gcc`/`musl-dev`/`make` installed is enough to
+validate musl-specific behavior; day-to-day development does not
+require it.

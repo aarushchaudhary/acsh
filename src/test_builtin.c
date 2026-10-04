@@ -157,14 +157,29 @@ int builtin_test(Command *cmd) {
     int argc = cmd->argc;
     char **argv = cmd->argv;
 
-    /* strip argv[0] ("test" or "["), and for "[" require and strip a
-     * trailing "]" */
+    /* strip argv[0] ("test", "[", or "[["), and for "[" / "[[" require
+     * and strip a matching trailing "]" / "]]" */
     int start = 1;
     int end = argc;
 
     if (strcmp(argv[0], "[") == 0) {
         if (argc < 2 || strcmp(argv[argc - 1], "]") != 0) {
             fprintf(stderr, "acsh: [: missing closing ']'\n");
+            return 2;
+        }
+        end = argc - 1;
+    } else if (strcmp(argv[0], "[[") == 0) {
+        /* [[ ... ]] is bash/ksh syntax, not POSIX test -- acsh
+         * accepts it as a synonym for test/[ using the SAME operator
+         * set (see eval_primary() above), plus normalizing == to =
+         * below, since that's the one [[ ]]-specific spelling people
+         * reach for constantly. Bash's other [[ ]]-only features
+         * (=~ regex matching, unquoted word-splitting-safe variable
+         * expansion, pattern matching against glob-style patterns in
+         * ==) are NOT implemented -- a documented scope limitation,
+         * same spirit as test's own -a/-o limitation noted above. */
+        if (argc < 2 || strcmp(argv[argc - 1], "]]") != 0) {
+            fprintf(stderr, "acsh: [[: missing closing ']]'\n");
             return 2;
         }
         end = argc - 1;
@@ -175,10 +190,33 @@ int builtin_test(Command *cmd) {
         return 1; /* `test` with no arguments is false */
     }
 
+    /* Build a LOCAL copy of the argument pointer array with ==
+     * normalized to = , rather than overwriting argv[] in place:
+     * argv[] entries are heap pointers owned by the Pipeline this
+     * Command came from (allocated in parser.c, freed later by
+     * pipeline_free()) -- replacing one with a pointer to a string
+     * literal here would make that later free() call operate on a
+     * literal's address instead of a real heap allocation, which is
+     * undefined behaviour (and reliably crashes under glibc, as
+     * caught during testing: "munmap_chunk(): invalid pointer"). A
+     * local array of pointers avoids touching argv[] at all. */
+    char *normalized[64];
+    int norm_count = inner_argc < 64 ? inner_argc : 64;
+    for (int i = 0; i < norm_count; i++) {
+        normalized[i] = (strcmp(argv[start + i], "==") == 0)
+        ? (char *)"=" : argv[start + i];
+    }
+
     int error = 0;
-    int result = eval_test(inner_argc, argv + start, &error);
+    int result = eval_test(norm_count, normalized, &error);
     if (error) {
-        fprintf(stderr, "acsh: test: malformed expression\n");
+        fprintf(stderr, "acsh: test: malformed expression:");
+        for (int i = start; i < end; i++) {
+            fprintf(stderr, " %s", argv[i]);
+        }
+        fprintf(stderr, "\n"
+        "  acsh: supported forms: test STR | test STR1 = STR2 | test N1 -eq N2\n"
+        "  acsh:                  test -z STR | test -f/-d/-e PATH | test ! EXPR\n");
         return 2;
     }
 
