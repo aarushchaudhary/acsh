@@ -34,12 +34,12 @@ jobs:
         run: |
           mkdir dist
           cp acsh dist/
-          cp config/acshrc.default dist/.ashrc
+          cp config/acshrc.default dist/.acshrc
 
       - name: Create GitHub Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/acsh
-            dist/.ashrc
+            dist/.acshrc
           generate_release_notes: true
