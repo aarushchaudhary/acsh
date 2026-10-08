@@ -39,6 +39,8 @@ cp config/acshrc.default ~/.acshrc
 ```
 acsh/
 ├── Makefile
+├── .github/workflows/
+│   └── release.yml         CI Pipeline config file
 ├── README.md
 ├── config/
 │   └── acshrc.default      shipped ~/.acshrc template
