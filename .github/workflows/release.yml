@@ -1,0 +1,45 @@
+name: Build and Release ACSH
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    name: Build Binary and Publish Release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc make
+
+      - name: Run Test Suite
+        run: |
+          chmod +x test_acsh.sh
+          ./test_acsh.sh
+
+      - name: Build ACSH
+        run: make
+
+      - name: Stage Artifacts
+        run: |
+          mkdir dist
+          cp acsh dist/
+          cp config/acshrc.default dist/.ashrc
+
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/acsh
+            dist/.ashrc
+          generate_release_notes: true
