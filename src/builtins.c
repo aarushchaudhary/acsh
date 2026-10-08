@@ -413,6 +413,10 @@ static int builtin_command(Command *cmd) {
     shifted.infile = cmd->infile;
     shifted.outfile = cmd->outfile;
     shifted.append = cmd->append;
+    shifted.errfile = cmd->errfile;
+    shifted.err_append = cmd->err_append;
+    shifted.dup_from = cmd->dup_from;
+    shifted.dup_to = cmd->dup_to;
 
     int exit_status = 0;
     if (try_run_builtin(&shifted, &exit_status)) {

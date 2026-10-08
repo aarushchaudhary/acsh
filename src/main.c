@@ -153,7 +153,41 @@ static void load_rc_file(void) {
     run_script_file(path);
 }
 
-int main(void) {
+/* `acsh SCRIPTFILE` (as opposed to plain interactive `acsh` with no
+ * arguments) runs every line of SCRIPTFILE non-interactively: no
+ * prompt is printed, lines are not added to history, and the shell
+ * exits with the script's last command's status once the file ends
+ * rather than dropping to an interactive prompt afterward. This is
+ * what makes a `#!/usr/bin/env acsh` shebang line work on a script
+ * file -- without argv handling at all, acsh could only ever be used
+ * interactively or via `source`/`.` from within an already-running
+ * session, which is insufficient for a script meant to be executed
+ * directly. */
+static int run_as_script(const char *path) {
+    signals_init();
+    alias_load_defaults();
+    /* Deliberately do NOT load ~/.acshrc or history for a
+     * non-interactive script run: those are interactive-session
+     * conveniences, and a script's output/behaviour should not
+     * depend on whoever's ~/.acshrc happens to be present when it
+     * runs -- the same reasoning real shells use for distinguishing
+     * login/interactive shells from plain script execution. */
+
+    int rc = run_script_file(path);
+    if (rc != 0) {
+        /* run_script_file() already printed why (e.g. file not found) */
+        return 127;
+    }
+
+    trap_run_exit();
+    return env_get_last_status();
+}
+
+int main(int argc, char *argv[]) {
+    if (argc > 1) {
+        return run_as_script(argv[1]);
+    }
+
     char line[ACSH_MAX_LINE];
 
     signals_init();

@@ -203,3 +203,8 @@ Alpine/musl environment specifically, building inside an Alpine
 container or VM with `gcc`/`musl-dev`/`make` installed is enough to
 validate musl-specific behavior; day-to-day development does not
 require it.
+
+---
+
+Author: Aarush Chaudhary
+License: GPLv3

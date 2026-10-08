@@ -69,7 +69,8 @@ static int eval_primary(int argc, char *argv[], int *idx, int *error) {
         return (a[1] == 'z') ? empty : !empty;
     }
     if (strcmp(a, "-f") == 0 || strcmp(a, "-d") == 0 || strcmp(a, "-e") == 0 ||
-        strcmp(a, "-r") == 0 || strcmp(a, "-w") == 0 || strcmp(a, "-x") == 0) {
+        strcmp(a, "-r") == 0 || strcmp(a, "-w") == 0 || strcmp(a, "-x") == 0 ||
+        strcmp(a, "-s") == 0) {
         if (*idx + 1 >= argc) { *error = 1; return 0; }
         const char *path = argv[*idx + 1];
     char op = a[1];
@@ -84,6 +85,7 @@ static int eval_primary(int argc, char *argv[], int *idx, int *error) {
     if (op == 'r') return access(path, R_OK) == 0;
     if (op == 'w') return access(path, W_OK) == 0;
     if (op == 'x') return access(path, X_OK) == 0;
+    if (op == 's') return stat_ok && st.st_size > 0;
     return 0;
         }
 

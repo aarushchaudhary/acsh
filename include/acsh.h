@@ -46,6 +46,22 @@ typedef struct {
     char *infile;                /* filename for  <   (NULL if none) */
     char *outfile;                /* filename for  >   (NULL if none) */
     int   append;                 /* 1 if redirection was >> instead of > */
+
+    /* stderr redirected to a file: "2>file" or "2>>file". Kept as its
+     * own slot (rather than reusing outfile with a target-fd field)
+     * because a single command can reasonably have BOTH a stdout
+     * redirect and a stderr redirect at the same time, e.g.
+     * `cmd > out.txt 2> err.txt`, and each needs its own filename. */
+    char *errfile;                /* filename for 2>  (NULL if none) */
+    int   err_append;             /* 1 if it was 2>> instead of 2> */
+
+    /* fd-duplication redirection, e.g. "2>&1" (stderr onto wherever
+     * stdout currently points) or "1>&2". dup_from/dup_to are -1 when
+     * no such redirection is present on this command. Only the simple
+     * "N>&M" form is supported (both sides literal fd numbers 0, 1,
+     * or 2) -- the cases real-world scripts overwhelmingly use. */
+    int   dup_from;               /* the fd being redirected, e.g. 2 in "2>&1" */
+    int   dup_to;                 /* the fd it's duplicated onto, e.g. 1 in "2>&1" */
 } Command;
 
 /*

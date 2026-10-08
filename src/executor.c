@@ -33,6 +33,28 @@ static void apply_redirection(Command *cmd) {
         dup2(fd, STDOUT_FILENO);
         close(fd);
     }
+
+    if (cmd->errfile != NULL) {
+        int flags = O_WRONLY | O_CREAT | (cmd->err_append ? O_APPEND : O_TRUNC);
+        int fd = open(cmd->errfile, flags, 0644);
+        if (fd < 0) {
+            perror("acsh: open (errfile)");
+            _exit(1);
+        }
+        dup2(fd, STDERR_FILENO);
+        close(fd);
+    }
+
+    /* fd-duplication (e.g. "2>&1") is applied LAST, after any file
+     * redirection above -- this ordering matters: `cmd > file 2>&1`
+     * must make fd 2 point at the SAME PLACE fd 1 now points (the
+     * file), not wherever fd 1 originally pointed. */
+    if (cmd->dup_from >= 0 && cmd->dup_to >= 0) {
+        if (dup2(cmd->dup_to, cmd->dup_from) < 0) {
+            perror("acsh: dup2");
+            _exit(1);
+        }
+    }
 }
 
 /* Child processes must reset the signal handling they inherited from
@@ -51,6 +73,112 @@ static void reset_child_signals(void) {
     signal(SIGTSTP, SIG_DFL);
     signal(SIGCHLD, SIG_DFL);
     unblock_sigchld();
+}
+
+/* Saved file descriptors from apply_redirection_with_restore(), so
+ * redirect_restore() can put the parent process's stdin/stdout back
+ * exactly as they were before a builtin/function (which runs IN the
+ * parent process, not a forked child -- see the n==1 dispatch in
+ * execute_pipeline() below) temporarily redirected them. -1 means
+ * that fd was not touched and needs no restoring. */
+typedef struct {
+    int saved_stdin;
+    int saved_stdout;
+    int saved_stderr;
+} RedirectSave;
+
+/* Applies this command's redirection to the CURRENT process (the
+ * shell's own parent process, for a builtin/function in the n==1
+ * dispatch path -- it never forks). Unlike apply_redirection() (used
+ * by actual forked children, which simply dup2() and then either
+ * execvp() or _exit(), so the original fds never need restoring),
+ * this version FIRST SAVES the process's real stdin/stdout via dup()
+ * so redirect_restore() can put them back afterward. Without this,
+ * a builtin's redirection would permanently redirect the
+ * INTERACTIVE SHELL's own stdout for every command after it.
+ *
+ * This fixes a real bug found via test_acsh.sh: `type cd > file` (any
+ * builtin/function with redirection, run standalone) silently did
+ * nothing -- builtins in the n==1 parent-process path never called
+ * ANY redirection logic at all before this fix existed. */
+static RedirectSave apply_redirection_with_restore(Command *cmd) {
+    RedirectSave save = { -1, -1, -1 };
+
+    /* Flush BEFORE touching the fds: stdio buffers output internally,
+     * so without this flush, text already written by this process
+     * could still be sitting in the C library's buffer and end up
+     * flushed to whatever fd 1 happens to point at AFTER this
+     * function's dup2() calls run, rather than where it belonged. */
+    fflush(stdout);
+
+    if (cmd->infile != NULL) {
+        int fd = open(cmd->infile, O_RDONLY);
+        if (fd < 0) {
+            perror("acsh: open (infile)");
+            return save;
+        }
+        save.saved_stdin = dup(STDIN_FILENO);
+        dup2(fd, STDIN_FILENO);
+        close(fd);
+    }
+
+    if (cmd->outfile != NULL) {
+        int flags = O_WRONLY | O_CREAT | (cmd->append ? O_APPEND : O_TRUNC);
+        int fd = open(cmd->outfile, flags, 0644);
+        if (fd < 0) {
+            perror("acsh: open (outfile)");
+            return save;
+        }
+        save.saved_stdout = dup(STDOUT_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        close(fd);
+    }
+
+    if (cmd->errfile != NULL) {
+        int flags = O_WRONLY | O_CREAT | (cmd->err_append ? O_APPEND : O_TRUNC);
+        int fd = open(cmd->errfile, flags, 0644);
+        if (fd < 0) {
+            perror("acsh: open (errfile)");
+            return save;
+        }
+        save.saved_stderr = dup(STDERR_FILENO);
+        dup2(fd, STDERR_FILENO);
+        close(fd);
+    }
+
+    if (cmd->dup_from >= 0 && cmd->dup_to >= 0) {
+        /* save whichever fd is about to be overwritten, if not
+         * already saved above, so it gets restored afterward */
+        if (cmd->dup_from == STDERR_FILENO && save.saved_stderr < 0) {
+            save.saved_stderr = dup(STDERR_FILENO);
+        } else if (cmd->dup_from == STDOUT_FILENO && save.saved_stdout < 0) {
+            save.saved_stdout = dup(STDOUT_FILENO);
+        }
+        dup2(cmd->dup_to, cmd->dup_from);
+    }
+
+    return save;
+}
+
+/* Restores whatever apply_redirection_with_restore() saved. Flushes
+ * stdout FIRST, before swapping the fd back, for the same buffering
+ * reason noted above -- this is what actually gets the builtin's
+ * output into the redirected destination before the original fd is
+ * restored underneath it. */
+static void redirect_restore(RedirectSave save) {
+    fflush(stdout);
+    if (save.saved_stdin >= 0) {
+        dup2(save.saved_stdin, STDIN_FILENO);
+        close(save.saved_stdin);
+    }
+    if (save.saved_stdout >= 0) {
+        dup2(save.saved_stdout, STDOUT_FILENO);
+        close(save.saved_stdout);
+    }
+    if (save.saved_stderr >= 0) {
+        dup2(save.saved_stderr, STDERR_FILENO);
+        close(save.saved_stderr);
+    }
 }
 
 /* Converts a raw wait() status into a shell-style exit code: normal
@@ -153,12 +281,36 @@ int execute_pipeline(Pipeline *pl) {
      * part of a PIPELINE (n > 1) is a known scope limitation --
      * acsh does not support that; only standalone function calls do. */
     if (n == 1) {
-        int exit_status = 0;
-        if (try_run_builtin(&pl->cmds[0], &exit_status)) {
-            return exit_status;
+        Command *only = &pl->cmds[0];
+        int has_redirection = (only->infile != NULL || only->outfile != NULL ||
+        only->errfile != NULL ||
+        (only->dup_from >= 0 && only->dup_to >= 0));
+
+        if (function_is_defined(only->argv[0]) && !has_redirection) {
+            /* the common, simple case: a function with no
+             * redirection -- skip the save/restore machinery entirely */
+            return function_call(only->argc, only->argv);
         }
-        if (function_is_defined(pl->cmds[0].argv[0])) {
-            return function_call(pl->cmds[0].argc, pl->cmds[0].argv);
+
+        RedirectSave save = { -1, -1, -1 };
+        if (has_redirection) {
+            save = apply_redirection_with_restore(only);
+        }
+
+        int exit_status = 0;
+        int ran_builtin = try_run_builtin(only, &exit_status);
+        int ran_function = 0;
+        if (!ran_builtin && function_is_defined(only->argv[0])) {
+            exit_status = function_call(only->argc, only->argv);
+            ran_function = 1;
+        }
+
+        if (has_redirection) {
+            redirect_restore(save);
+        }
+
+        if (ran_builtin || ran_function) {
+            return exit_status;
         }
     }
 
@@ -226,6 +378,31 @@ int execute_pipeline(Pipeline *pl) {
             }
 
             apply_redirection(cmd);
+
+            /* A builtin or function used as ONE STAGE of a multi-
+             * command pipeline (e.g. `alias | grep ll`, or a function
+             * piped into something) was previously never recognized
+             * here at all -- try_run_builtin()/function_call() were
+             * only ever consulted for the n==1 (single command, no
+             * pipe) case earlier in this function, so a builtin name
+             * anywhere inside a pipe fell straight through to
+             * execvp() and failed with "command not found". Since
+             * each pipeline stage is already its own forked child
+             * process, running the builtin/function HERE and exiting
+             * with its status is both correct and safe. Found via
+             * test_acsh.sh (`alias | grep ll` failed outright). */
+            {
+                int exit_status = 0;
+                if (try_run_builtin(cmd, &exit_status)) {
+                    fflush(stdout);
+                    _exit(exit_status);
+                }
+                if (function_is_defined(cmd->argv[0])) {
+                    exit_status = function_call(cmd->argc, cmd->argv);
+                    fflush(stdout);
+                    _exit(exit_status);
+                }
+            }
 
             execvp(cmd->argv[0], cmd->argv);
             /* execvp only returns on failure -- errno tells us WHY,

@@ -42,9 +42,10 @@
  * checks for this one flag before attempting tilde expansion, then
  * strips it. */
 
-#define SQ_START     '\x01'
-#define SQ_END       '\x02'
-#define QUOTED_FIRST '\x03'
+#define SQ_START       '\x01'
+#define SQ_END         '\x02'
+#define QUOTED_FIRST   '\x03'
+#define ESCAPED_DOLLAR '\x04'
 
 #define MAX_TOKENS 256
 
@@ -163,7 +164,26 @@ static int read_word(char **pp, char *buf, size_t bufsize) {
                 if (is_first_char) { first_char_quoted = 1; is_first_char = 0; }
                 p++;
                 while (*p != '\0' && *p != '"') {
-                    if (*p == '\\' && (p[1] == '"' || p[1] == '\\' || p[1] == '$')) {
+                    if (*p == '\\' && p[1] == '$') {
+                        /* \$ inside "..." must become a LITERAL $ that
+                         * env_expand() never treats as the start of a
+                         * variable reference -- emitting a plain '$' byte
+                         * here would be indistinguishable from a real,
+                         * unescaped '$' by the time env_expand() looks at
+                         * this buffer (the backslash itself is gone by
+                         * then), so env_expand() would incorrectly try to
+                         * expand whatever word-characters follow it. The
+                         * ESCAPED_DOLLAR sentinel marks this one specific
+                         * '$' as "always literal". Found via
+                         * test_acsh.sh: echo "\$FOO" was silently eating
+                         * the $ and the rest of the word instead of
+                         * printing a literal $FOO. */
+                        if (len + 1 >= bufsize) goto too_long;
+                        buf[len++] = ESCAPED_DOLLAR;
+                        p += 2;
+                        continue;
+                    }
+                    if (*p == '\\' && (p[1] == '"' || p[1] == '\\')) {
                         if (len + 1 >= bufsize) goto too_long;
                         buf[len++] = p[1];
                         p += 2;
@@ -251,6 +271,36 @@ static int tokenize(char *line, char *tokens[], int max_tokens) {
             break;
         }
 
+        /* fd-prefixed redirection: a digit (0, 1, or 2) immediately
+         * followed by '<' or '>', with NO space between the digit and
+         * the operator -- covers both "N>&M" fd-duplication (e.g.
+         * "2>&1") AND plain "N>file" / "N>>file" / "N<file" (e.g.
+         * "2>/dev/null"). MUST be checked BEFORE the plain '<'/'>'
+         * handling below: otherwise the leading digit is consumed as
+         * an ordinary word before this check could ever run (found via
+         * test_acsh.sh: `2>/dev/null` silently passed a literal "2" as
+         * a command argument instead of redirecting fd 2 at all, and
+         * `2>&1` fell apart into separate "2", ">", "&", "1" tokens).
+         * Only 0/1/2 single-digit fds are recognized. */
+        if ((*p == '0' || *p == '1' || *p == '2') && (p[1] == '>' || p[1] == '<')) {
+            if (p[1] == '>' && p[2] == '&' && (p[3] == '0' || p[3] == '1' || p[3] == '2')) {
+                tokens[n] = strndup(p, 4);   /* "N>&M" fd duplication */
+                n++;
+                p += 4;
+                continue;
+            }
+            if (p[1] == '>' && p[2] == '>') {
+                tokens[n] = strndup(p, 3);   /* "N>>" fd-prefixed append */
+                n++;
+                p += 3;
+                continue;
+            }
+            tokens[n] = strndup(p, 2);       /* "N>" or "N<" fd-prefixed redirect */
+            n++;
+            p += 2;
+            continue;
+        }
+
         if (*p == '|' || *p == '<' || *p == '&' ) {
             tokens[n] = strndup(p, 1);
             n++;
@@ -305,6 +355,8 @@ int parse_line(char *line, Pipeline *pl) {
     int ci = 0;                  /* current command index in pl->cmds */
     Command *cur = &pl->cmds[ci];
     cur->argc = 0;
+    cur->dup_from = -1;          /* -1 = no fd-duplication on this command */
+    cur->dup_to = -1;
 
     for (int i = 0; i < ntok; i++) {
         char *tok = tokens[i];
@@ -319,65 +371,106 @@ int parse_line(char *line, Pipeline *pl) {
             }
             cur = &pl->cmds[ci];
             cur->argc = 0;
+            cur->dup_from = -1;
+            cur->dup_to = -1;
             continue;
         }
 
-        if (strcmp(tok, "<") == 0) {
-            i++;
-            if (i >= ntok) {
-                fprintf(stderr, "acsh: syntax error: expected filename after <\n");
-                free_tokens(tokens, ntok);
-                return -1;
+        /* fd-duplication token, e.g. "2>&1" or "1>&2" (one atomic
+         * 4-character token from tokenize()) */
+        if (strlen(tok) == 4 && (tok[0] == '0' || tok[0] == '1' || tok[0] == '2') &&
+            tok[1] == '>' && tok[2] == '&' &&
+            (tok[3] == '0' || tok[3] == '1' || tok[3] == '2')) {
+            cur->dup_from = tok[0] - '0';
+        cur->dup_to = tok[3] - '0';
+        continue;
             }
-            cur->infile = env_expand(tokens[i]);
-            continue;
-        }
 
-        if (strcmp(tok, ">") == 0 || strcmp(tok, ">>") == 0) {
-            int append = (strcmp(tok, ">>") == 0);
+            /* fd-prefixed redirect to a FILE: "2>file", "2>>file", and the
+             * numerically-explicit forms of stdout/stdin ("1>file",
+             * "0<file"), which behave exactly like their unprefixed
+             * equivalents */
+            if ((strlen(tok) == 2 || strlen(tok) == 3) &&
+                (tok[0] == '0' || tok[0] == '1' || tok[0] == '2') &&
+                (tok[1] == '>' || tok[1] == '<')) {
+                int fd = tok[0] - '0';
+            int is_append = (tok[1] == '>' && tok[2] == '>');
+            int is_input = (tok[1] == '<');
             i++;
             if (i >= ntok) {
                 fprintf(stderr, "acsh: syntax error: expected filename after %s\n", tok);
                 free_tokens(tokens, ntok);
                 return -1;
             }
-            cur->outfile = env_expand(tokens[i]);
-            cur->append = append;
-            continue;
-        }
-
-        if (strcmp(tok, "&") == 0) {
-            pl->background = 1;
-            continue;
-        }
-
-        /* regular argument word: env_expand ($VAR, ~) happens first,
-         * then glob_expand (star, ?, [) against the result -- this
-         * order matters, e.g. "$DIR" followed by "star.c" must expand
-         * DIR before globbing. A single word can expand into MULTIPLE
-         * argv entries here (e.g. star.c -> main.c parser.c ...). */
-        {
-            char *var_expanded = env_expand(tok);
-            if (var_expanded == NULL) {
-                fprintf(stderr, "acsh: out of memory\n");
-                free_tokens(tokens, ntok);
-                return -1;
+            char *target = env_expand(tokens[i]);
+            if (is_input) {
+                cur->infile = target;          /* only fd 0 is meaningful for input */
+            } else if (fd == 2) {
+                cur->errfile = target;
+                cur->err_append = is_append;
+            } else {
+                cur->outfile = target;         /* "1>file" == ">file" */
+                cur->append = is_append;
             }
-
-            char *glob_results[ACSH_MAX_ARGS];
-            int nglob = glob_expand(var_expanded, glob_results, ACSH_MAX_ARGS - cur->argc - 1);
-            free(var_expanded);
-
-            for (int g = 0; g < nglob; g++) {
-                if (cur->argc >= ACSH_MAX_ARGS - 1) {
-                    fprintf(stderr, "acsh: too many arguments\n");
-                    free_tokens(tokens, ntok);
-                    return -1;
+            continue;
                 }
-                cur->argv[cur->argc] = glob_results[g];
-                cur->argc++;
-            }
-        }
+
+                if (strcmp(tok, "<") == 0) {
+                    i++;
+                    if (i >= ntok) {
+                        fprintf(stderr, "acsh: syntax error: expected filename after <\n");
+                        free_tokens(tokens, ntok);
+                        return -1;
+                    }
+                    cur->infile = env_expand(tokens[i]);
+                    continue;
+                }
+
+                if (strcmp(tok, ">") == 0 || strcmp(tok, ">>") == 0) {
+                    int append = (strcmp(tok, ">>") == 0);
+                    i++;
+                    if (i >= ntok) {
+                        fprintf(stderr, "acsh: syntax error: expected filename after %s\n", tok);
+                        free_tokens(tokens, ntok);
+                        return -1;
+                    }
+                    cur->outfile = env_expand(tokens[i]);
+                    cur->append = append;
+                    continue;
+                }
+
+                if (strcmp(tok, "&") == 0) {
+                    pl->background = 1;
+                    continue;
+                }
+
+                /* regular argument word: env_expand ($VAR, ~) happens first,
+                 * then glob_expand (star, ?, [) against the result -- this
+                 * order matters, e.g. "$DIR" followed by "star.c" must expand
+                 * DIR before globbing. A single word can expand into MULTIPLE
+                 * argv entries here (e.g. star.c -> main.c parser.c ...). */
+                {
+                    char *var_expanded = env_expand(tok);
+                    if (var_expanded == NULL) {
+                        fprintf(stderr, "acsh: out of memory\n");
+                        free_tokens(tokens, ntok);
+                        return -1;
+                    }
+
+                    char *glob_results[ACSH_MAX_ARGS];
+                    int nglob = glob_expand(var_expanded, glob_results, ACSH_MAX_ARGS - cur->argc - 1);
+                    free(var_expanded);
+
+                    for (int g = 0; g < nglob; g++) {
+                        if (cur->argc >= ACSH_MAX_ARGS - 1) {
+                            fprintf(stderr, "acsh: too many arguments\n");
+                            free_tokens(tokens, ntok);
+                            return -1;
+                        }
+                        cur->argv[cur->argc] = glob_results[g];
+                        cur->argc++;
+                    }
+                }
     }
 
     cur->argv[cur->argc] = NULL;
@@ -503,5 +596,7 @@ void pipeline_free(Pipeline *pl) {
         c->infile = NULL;
         free(c->outfile);
         c->outfile = NULL;
+        free(c->errfile);
+        c->errfile = NULL;
     }
 }

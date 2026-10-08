@@ -9,9 +9,10 @@
  * in. They mark regions where '$' must NOT be expanded (true POSIX
  * single-quote behaviour). See parser.c's tokenizer comment for why
  * this two-pass design (tokenize, then expand) is used. */
-#define SQ_START     '\x01'
-#define SQ_END       '\x02'
-#define QUOTED_FIRST '\x03'
+#define SQ_START       '\x01'
+#define SQ_END         '\x02'
+#define QUOTED_FIRST   '\x03'
+#define ESCAPED_DOLLAR '\x04'
 
 /* Returns 1 if c can appear in a shell variable name ([A-Za-z0-9_]). */
 static int is_var_char(char c) {
@@ -308,6 +309,15 @@ char *env_expand(const char *word) {
             }
             if (*p == SQ_END) {
                 in_single_quotes = 0;
+                p++;
+                continue;
+            }
+
+            if (*p == ESCAPED_DOLLAR) {
+                /* \$ inside "..." (see parser.c's read_word): always a
+                 * literal '$', NEVER the start of a variable reference. */
+                if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+                out[len++] = '$';
                 p++;
                 continue;
             }
