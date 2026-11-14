@@ -26,25 +26,10 @@ char *command_substitute(const char *cmd) {
         return strdup("");
     }
 
-    /* Block SIGCHLD around this function's own fork()/waitpid(), for
-     * exactly the same reason execute_pipeline() blocks it around ITS
-     * fork()/waitpid() (see the long comment at that call site in
-     * executor.c). The main shell process has an installed async
-     * SIGCHLD handler (signals.c) that reaps any of its children via
-     * a WNOHANG loop whenever the signal arrives. The child forked
-     * below often exits almost immediately (e.g. `$(false)`), so
-     * without blocking here, that async handler can reap this
-     * function's own direct child BEFORE the explicit waitpid() call
-     * further down ever runs -- making that waitpid() fail with
-     * ECHILD and silently leaving this function unable to observe the
-     * real exit status. This is a SEPARATE instance of the same race
-     * already fixed once in execute_pipeline(): that fix protects
-     * execute_pipeline()'s own fork/wait pairs, but does nothing for
-     * THIS function's outer fork/wait pair, which runs one level
-     * further out (this function forks a subshell that itself calls
-     * execute_pipeline() for whatever command is inside the
-     * substitution -- two independent fork/wait pairs, two
-     * independent places this exact race can happen). */
+    /* SIGCHLD stays blocked from before the fork until our waitpid():
+     * otherwise the async handler (signals.c) can reap a fast child,
+     * e.g. $(false), first, and its exit status is lost. The same rule
+     * as for every job in exec.c. */
     block_sigchld();
 
     pid_t pid = fork();
@@ -62,37 +47,12 @@ char *command_substitute(const char *cmd) {
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
-        /* The child inherited the parent's signal HANDLER for
-         * SIGCHLD, so restore it to default here -- and also inherited
-         * SIGCHLD being BLOCKED (block_sigchld() above, before this
-         * fork()), which must be undone too: this subshell is about
-         * to call execute_chain()/execute_pipeline() for whatever
-         * command is inside the substitution, and THAT code manages
-         * its own SIGCHLD blocking around its own fork/wait pair (see
-         * executor.c) -- it needs to start from an unblocked mask, the
-         * same as any freshly-started command execution would. */
-        signal(SIGCHLD, SIG_DFL);
-        unblock_sigchld();
-
-        char *text = strdup(cmd);
-        if (text == NULL) {
-            _exit(1);
-        }
-
-        /* Normalize newlines to ';' so a multi-line substitution body
-         * runs as several statements, matching what control_flow.c
-         * does for multi-line construct bodies. */
-        for (char *q = text; *q != '\0'; q++) {
-            if (*q == '\n') *q = ';';
-        }
-
-        Chain ch;
-        if (parse_chain(text, &ch) == 0 && ch.num_segments > 0) {
-            execute_chain(&ch);
-        }
-        free(text);
+        /* the subshell: a forked copy of this shell runs the text and
+         * exits with its status; nothing it changes reaches the parent */
+        child_setup_subshell();
+        int status = run_string(cmd);
         fflush(stdout);
-        _exit(env_get_last_status() & 0xff);
+        _exit(status & 0xff);
     }
 
     /* ---- parent ---- */

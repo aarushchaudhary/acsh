@@ -5,7 +5,7 @@
 #
 # This file is itself an acsh script and only uses syntax acsh
 # actually supports (see README.md "Known limitations": no arithmetic
-# expansion, no quoting inside a `for` word list, etc).
+# expansion, etc).
 #
 # HOW TO RUN (from the project root, after `make`):
 #
@@ -48,22 +48,24 @@ echo ""
 echo "--- Section 1: beyond-ash features (README claims) ---"
 
 echo ""
-echo "[1.1] Default aliases (ll, la, .., ..., grep)"
-alias | grep "^alias ll=" > /tmp/acsh_test_alias_check 2>/dev/null
-if test -s /tmp/acsh_test_alias_check
+echo "[1.1] Default aliases in an interactive session, none in scripts"
+echo "alias" > /tmp/acsh_test_alias_input
+./acsh < /tmp/acsh_test_alias_input > /tmp/acsh_test_alias_check 2>&1
+if grep -q "alias ll=" /tmp/acsh_test_alias_check
 then
     check_eq "default alias ll is defined at startup" "yes" "yes"
 else
     check_eq "default alias ll is defined at startup" "yes" "no"
 fi
-alias | grep "^alias la=" > /tmp/acsh_test_alias_check 2>/dev/null
-if test -s /tmp/acsh_test_alias_check
+if grep -q "alias la=" /tmp/acsh_test_alias_check
 then
     check_eq "default alias la is defined at startup" "yes" "yes"
 else
     check_eq "default alias la is defined at startup" "yes" "no"
 fi
-rm -f /tmp/acsh_test_alias_check
+RESULT=$(alias | wc -l)
+check_eq "no default aliases inside a script" "0" "$RESULT"
+rm -f /tmp/acsh_test_alias_input /tmp/acsh_test_alias_check
 
 echo ""
 echo "[1.2] Persistent history (~/.acsh_history gets written to)"
@@ -84,6 +86,8 @@ then
 else
     check_eq "command persisted to ~/.acsh_history" "yes" "no (file never created)"
 fi
+RESULT=$(ls -l $HOME/.acsh_history | cut -c1-10)
+check_eq "history file is readable only by its owner" "-rw-------" "$RESULT"
 rm -rf $HOME /tmp/acsh_test_hist_input
 
 echo ""
@@ -412,8 +416,15 @@ unalias acsh_test_alias_cmd
 
 echo ""
 echo "[2.20] Builtins work as pipeline stages"
-RESULT=$(alias | grep "^alias ll=" | wc -l)
+alias acsh_pipe_alias="echo x"
+RESULT=$(alias | grep "^alias acsh_pipe_alias=" | wc -l)
 check_eq "builtin (alias) piped into grep" "1" "$RESULT"
+
+echo ""
+echo "[2.21] fg returns the job's exit status"
+sh -c "sleep 0.1; exit 3" > /dev/null &
+fg > /dev/null
+check_eq "fg reports the job's real status" "3" "$?"
 
 echo ""
 echo "=================================================="
@@ -430,4 +441,5 @@ then
     echo "All checks passed."
 else
     echo "Some checks failed -- see FAIL lines above for details."
+    exit 1
 fi

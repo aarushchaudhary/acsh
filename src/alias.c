@@ -66,36 +66,3 @@ void alias_print_all(void) {
         }
     }
 }
-
-char *alias_expand_line(const char *line) {
-    /* find the first word (up to the first space or end of string) */
-    const char *p = line;
-    while (*p == ' ' || *p == '\t') p++;
-
-    const char *word_start = p;
-    while (*p != '\0' && *p != ' ' && *p != '\t') p++;
-    size_t word_len = (size_t)(p - word_start);
-
-    if (word_len == 0 || word_len >= 64) {
-        return NULL;
-    }
-
-    char first_word[64];
-    memcpy(first_word, word_start, word_len);
-    first_word[word_len] = '\0';
-
-    const char *expansion = alias_get(first_word);
-    if (expansion == NULL) {
-        return NULL;
-    }
-
-    /* rebuild: <expansion><rest of original line starting at p> */
-    size_t rest_len = strlen(p);
-    size_t total_len = strlen(expansion) + rest_len + 1;
-    char *result = malloc(total_len);
-    if (result == NULL) {
-        return NULL;
-    }
-    snprintf(result, total_len, "%s%s", expansion, p);
-    return result;
-}

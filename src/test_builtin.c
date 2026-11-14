@@ -192,18 +192,16 @@ int builtin_test(Command *cmd) {
         return 1; /* `test` with no arguments is false */
     }
 
-    /* Build a LOCAL copy of the argument pointer array with ==
-     * normalized to = , rather than overwriting argv[] in place:
-     * argv[] entries are heap pointers owned by the Pipeline this
-     * Command came from (allocated in parser.c, freed later by
-     * pipeline_free()) -- replacing one with a pointer to a string
-     * literal here would make that later free() call operate on a
-     * literal's address instead of a real heap allocation, which is
-     * undefined behaviour (and reliably crashes under glibc, as
-     * caught during testing: "munmap_chunk(): invalid pointer"). A
-     * local array of pointers avoids touching argv[] at all. */
-    char *normalized[64];
-    int norm_count = inner_argc < 64 ? inner_argc : 64;
+    /* A copy of the argument pointers with == normalized to =, rather
+     * than overwriting argv[] in place: argv[] entries are heap strings
+     * the executor frees afterwards, so putting a string literal there
+     * would make that free() crash. */
+    char **normalized = malloc((size_t)inner_argc * sizeof(char *));
+    if (normalized == NULL) {
+        fprintf(stderr, "acsh: out of memory\n");
+        return 2;
+    }
+    int norm_count = inner_argc;
     for (int i = 0; i < norm_count; i++) {
         normalized[i] = (strcmp(argv[start + i], "==") == 0)
         ? (char *)"=" : argv[start + i];
@@ -211,6 +209,7 @@ int builtin_test(Command *cmd) {
 
     int error = 0;
     int result = eval_test(norm_count, normalized, &error);
+    free(normalized);
     if (error) {
         fprintf(stderr, "acsh: test: malformed expression:");
         for (int i = start; i < end; i++) {

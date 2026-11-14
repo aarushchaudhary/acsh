@@ -40,27 +40,33 @@ cp config/acshrc.default ~/.acshrc
 acsh/
 ├── Makefile
 ├── .github/workflows/
-│   └── release.yml         CI Pipeline config file
+│   ├── ci.yml              build + tests on every push and pull request
+│   └── release.yml         build, test and publish a release on a v* tag
 ├── README.md
 ├── config/
 │   └── acshrc.default      shipped ~/.acshrc template
 ├── include/
-│   └── acsh.h               shared structs and the full module API
+│   ├── acsh.h              shared types and the module API
+│   └── syntax.h            syntax tree, lexer and parser API
+├── tests/
+│   ├── run_diff.sh         runs tests/diff/*.sh under acsh and busybox ash, compares
+│   └── diff/               differential test scripts
+├── test_acsh.sh            feature test suite (run as ./acsh test_acsh.sh)
 └── src/
-    ├── main.c                REPL loop, startup sequence, trap wiring
-    ├── parser.c               tokenizer, quoting, expansion dispatch, chain splitting
-    ├── executor.c             fork/exec, pipes, redirection, job control, assignments
-    ├── builtins.c             cd, export, jobs, read, exec, type, command, local, set, trap, ...
-    ├── test_builtin.c         test / [ / [[ ]]
-    ├── control_flow.c         if/while/until/for/case, break/continue
-    ├── functions.c            shell function definitions and calls
-    ├── env.c                  $VAR expansion, $?, positional parameters, locals
-    ├── glob.c                 *, ?, [abc] pathname expansion
-    ├── subst.c                $(...) and `...` command substitution
-    ├── alias.c                alias table and line expansion
-    ├── history.c              persistent command history
-    ├── jobs.c                 background/stopped job table
-    └── signals.c              SIGCHLD/SIGINT/SIGTSTP handling, trap support
+    ├── main.c              startup, the prompt loop, running script files
+    ├── lexer.c / lex.h     input lines -> tokens (quoting, $(...), line continuation)
+    ├── parse.c             tokens -> syntax tree (recursive descent, POSIX grammar)
+    ├── exec.c              runs the tree: pipelines, jobs, redirections, if/while/for/case
+    ├── builtins.c          cd, export, jobs, read, exec, type, command, local, set, trap, ...
+    ├── test_builtin.c      test / [ / [[ ]]
+    ├── functions.c         shell function definitions and calls
+    ├── env.c               $VAR expansion, $?, positional parameters, locals
+    ├── glob.c              *, ?, [abc] pathname expansion
+    ├── subst.c             $(...) and `...` command substitution
+    ├── alias.c             alias table
+    ├── history.c           persistent command history
+    ├── jobs.c              background/stopped job table
+    └── signals.c           SIGCHLD/SIGINT/SIGTSTP handling, trap support
 ```
 
 ---

@@ -19,10 +19,11 @@ static const char *BUILTIN_NAMES[] = {
     "break", "continue", "test", "[", "[[", "cd", "exit", "pwd", "jobs", "fg", "bg",
     "export", "unset", "alias", "unalias", "history", "source", ".",
     "read", "exec", "umask", "type", "command", "shift", "local", "set", "eval", "trap",
+    "return",
     NULL
 };
 
-static int is_builtin_name(const char *name) {
+int is_builtin_name(const char *name) {
     for (int i = 0; BUILTIN_NAMES[i] != NULL; i++) {
         if (strcmp(BUILTIN_NAMES[i], name) == 0) {
             return 1;
@@ -57,7 +58,7 @@ static char *find_in_path(const char *name) {
     char *result = NULL;
     char *dir = strtok(path_copy, ":");
     while (dir != NULL) {
-        char candidate[ACSH_MAX_LINE];
+        char candidate[4096];
         snprintf(candidate, sizeof(candidate), "%s/%s", dir, name);
         if (access(candidate, X_OK) == 0) {
             result = strdup(candidate);
@@ -83,10 +84,35 @@ static int builtin_cd(Command *cmd) {
     return 0;
 }
 
+/* Parses all of `s` as a decimal number >= min for builtin `who`.
+ * On failure prints ash's "Illegal number" message and returns -1. */
+static int parse_number(const char *who, const char *s, long min, long *out) {
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (*s == '\0' || *end != '\0' || errno != 0 || v < min) {
+        fprintf(stderr, "acsh: %s: Illegal number: %s\n", who, s);
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+/* A usage error in a special builtin (exit, shift, break, continue)
+ * ends a non-interactive shell with status 2, as in ash; at the prompt
+ * it only fails the command. */
+static int special_builtin_error(void) {
+    if (!shell_is_interactive()) {
+        trap_run_exit();
+        exit(2);
+    }
+    return 2;
+}
+
 static int builtin_exit(Command *cmd) {
-    int code = 0;
-    if (cmd->argc > 1) {
-        code = atoi(cmd->argv[1]);
+    long code = env_get_last_status();
+    if (cmd->argc > 1 && parse_number("exit", cmd->argv[1], 0, &code) != 0) {
+        return special_builtin_error();
     }
     /* Run any `trap ... EXIT` before actually terminating -- exit()
      * jumps straight out of the process and never returns to
@@ -94,7 +120,7 @@ static int builtin_exit(Command *cmd) {
      * loop ends only covers the EOF/Ctrl+D path, not this one. Both
      * paths out of the shell must honor an EXIT trap. */
     trap_run_exit();
-    exit(code);
+    exit((int)(code & 0xff));
     return 0; /* unreachable */
 }
 
@@ -136,26 +162,42 @@ static int builtin_fg(Command *cmd) {
     }
 
     printf("%s\n", j->cmdline);
+    fflush(stdout);
 
-    /* resume it if it was stopped, then wait for it like any
-     * foreground pipeline */
-    kill(-j->pgid, SIGCONT);
+    /* SIGCHLD stays blocked while we wait, so the async handler cannot
+     * reap this job's processes and lose their exit status. */
+    block_sigchld();
+    if (j->state == JOB_DONE) {
+        int code = j->last_status; /* finished before fg was typed */
+        jobs_remove(j);
+        unblock_sigchld();
+        return code;
+    }
     jobs_mark_running(j->pgid);
-
+    kill(-j->pgid, SIGCONT);
     set_foreground_pgid(j->pgid);
-    int status;
-    int remaining = j->num_pids;
-    while (remaining > 0) {
+
+    int code = 0;
+    while (j->remaining > 0) {
+        int status;
         pid_t w = waitpid(-j->pgid, &status, WUNTRACED);
-        if (w < 0) break;
-        if (WIFSTOPPED(status)) {
-            jobs_mark_stopped(j->pgid);
+        if (w < 0) {
             break;
         }
-        remaining--;
+        if (WIFSTOPPED(status)) {
+            jobs_mark_stopped(j->pgid);
+            code = 128 + WSTOPSIG(status);
+            break;
+        }
+        jobs_child_exited(w, status);
+    }
+    if (j->state == JOB_DONE) {
+        code = j->last_status;
+        jobs_remove(j);
     }
     set_foreground_pgid(0);
-    return 0;
+    unblock_sigchld();
+    return code;
 }
 
 static int builtin_bg(Command *cmd) {
@@ -317,8 +359,8 @@ static int builtin_umask(Command *cmd) {
     char *endptr;
     long mode = strtol(cmd->argv[1], &endptr, 8);
     if (*endptr != '\0' || mode < 0 || mode > 0777) {
-        fprintf(stderr, "acsh: umask: %s: invalid octal mode\n", cmd->argv[1]);
-        return 1;
+        fprintf(stderr, "acsh: umask: illegal mode: %s\n", cmd->argv[1]);
+        return 2;
     }
     umask((mode_t)mode);
     return 0;
@@ -406,39 +448,17 @@ static int builtin_command(Command *cmd) {
      * is the entire point of `command`. */
     Command shifted;
     shifted.argc = cmd->argc - 1;
-    for (int i = 0; i < shifted.argc; i++) {
-        shifted.argv[i] = cmd->argv[i + 1];
-    }
-    shifted.argv[shifted.argc] = NULL;
-    shifted.infile = cmd->infile;
-    shifted.outfile = cmd->outfile;
-    shifted.append = cmd->append;
-    shifted.errfile = cmd->errfile;
-    shifted.err_append = cmd->err_append;
-    shifted.dup_from = cmd->dup_from;
-    shifted.dup_to = cmd->dup_to;
+    shifted.argv = cmd->argv + 1;   /* still NULL-terminated; nothing copied or freed */
+    shifted.argv_cap = 0;
 
     int exit_status = 0;
     if (try_run_builtin(&shifted, &exit_status)) {
         return exit_status;
     }
 
-    /* not a builtin: run it as an external command directly (NOT
-     * through execute_pipeline(), to avoid re-entering the
-     * function-dispatch path this builtin exists to skip) */
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("acsh: command: fork");
-        return 1;
-    }
-    if (pid == 0) {
-        execvp(shifted.argv[0], shifted.argv);
-        fprintf(stderr, "acsh: command: %s: command not found\n", shifted.argv[0]);
-        _exit(127);
-    }
-    int status;
-    waitpid(pid, &status, 0);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    /* not a builtin: run it as an external command, skipping any
+     * function of the same name */
+    return exec_external(shifted.argv);
 }
 
 static int builtin_exec(Command *cmd) {
@@ -468,9 +488,9 @@ static int builtin_exec(Command *cmd) {
  * string, then parses and runs THAT as a brand new command line --
  * this is what lets a variable holding shell syntax (e.g. a
  * dynamically-built command) actually be executed rather than just
- * treated as a literal argument. Runs through the full chain
- * machinery (parse_chain/execute_chain), so eval'd text can itself
- * contain pipes, &&/||/;, and even control-flow keywords. */
+ * treated as a literal argument. The text goes through the normal
+ * parser and executor (run_string), so it can contain anything a
+ * script line can. */
 /* `shift [N]` discards the first N positional parameters of the
  * CURRENT function call (default N=1), so $1 becomes what was
  * $((1+N)), and so on -- the standard way to loop over "$@" one
@@ -581,12 +601,12 @@ static int builtin_local(Command *cmd) {
 }
 
 static int builtin_shift(Command *cmd) {
-    int n = 1;
-    if (cmd->argc > 1) {
-        n = atoi(cmd->argv[1]);
+    long n = 1;
+    if (cmd->argc > 1 && parse_number("shift", cmd->argv[1], 0, &n) != 0) {
+        return special_builtin_error();
     }
-    if (env_shift_positional_params(n) != 0) {
-        fprintf(stderr, "acsh: shift: cannot shift %d (not enough positional "
+    if (env_shift_positional_params((int)n) != 0) {
+        fprintf(stderr, "acsh: shift: cannot shift %ld (not enough positional "
         "parameters, or not inside a function)\n", n);
         return 1;
     }
@@ -612,30 +632,61 @@ static int builtin_eval(Command *cmd) {
         if (i < cmd->argc - 1) strcat(joined, " ");
     }
 
-    Chain ch;
-    int status = 0;
-    if (parse_chain(joined, &ch) == 0 && ch.num_segments > 0) {
-        execute_chain(&ch);
-        status = env_get_last_status();
-    }
-
+    int status = run_string(joined);
     free(joined);
     return status;
 }
 
+/* Reads one line from fd 0 a byte at a time. A shell must not read
+ * ahead: stdio buffering would swallow input that belongs to the next
+ * `read` or to a command run after this one (e.g. in a
+ * `while read l; do ...; done < file` loop). Returns NULL if nothing
+ * could be read (end of input); *complete is 0 for a last line that
+ * has no newline. */
+static char *read_line_unbuffered(int *complete) {
+    size_t len = 0, cap = 64;
+    char *line = malloc(cap);
+    if (line == NULL) return NULL;
+    *complete = 0;
+    for (;;) {
+        char c;
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        if (c == '\n') {
+            *complete = 1;
+            break;
+        }
+        if (len + 2 > cap) {
+            char *bigger = realloc(line, cap *= 2);
+            if (bigger == NULL) { free(line); return NULL; }
+            line = bigger;
+        }
+        line[len++] = c;
+    }
+    line[len] = '\0';
+    if (len == 0 && !*complete) {
+        free(line);
+        return NULL;
+    }
+    return line;
+}
+
 static int builtin_read(Command *cmd) {
-    char line[ACSH_MAX_LINE];
-    if (fgets(line, sizeof(line), stdin) == NULL) {
+    int complete;
+    char *line = read_line_unbuffered(&complete);
+    if (line == NULL) {
         return 1; /* EOF */
     }
-    line[strcspn(line, "\n")] = '\0';
+    int status = complete ? 0 : 1; /* a last line without newline: set, but status 1 */
 
     int nvars = cmd->argc - 1;
     const char *default_var = "REPLY";
     if (nvars == 0) {
         /* no variable names given: whole line goes into $REPLY */
         setenv(default_var, line, 1);
-        return 0;
+        free(line);
+        return status;
     }
 
     char *p = line;
@@ -658,7 +709,8 @@ static int builtin_read(Command *cmd) {
         if (saved != '\0') p++;
     }
 
-    return 0;
+    free(line);
+    return status;
 }
 
 static int builtin_source(Command *cmd) {
@@ -666,7 +718,28 @@ static int builtin_source(Command *cmd) {
         fprintf(stderr, "acsh: source: usage: source FILE\n");
         return 1;
     }
-    return (run_script_file(cmd->argv[1]) == 0) ? 0 : 1;
+    return run_script_file(cmd->argv[1]);
+}
+
+/* `return [n]`: leaves the current function with status n (default:
+ * the last command's status), taken modulo 256 as in ash. Outside any
+ * function a script ends with that status, as in ash. */
+static int builtin_return(Command *cmd) {
+    long n = env_get_last_status();
+    if (cmd->argc > 1 && parse_number("return", cmd->argv[1], 0, &n) != 0) {
+        return special_builtin_error();
+    }
+    n &= 0xff;
+    if (env_get_call_depth() == 0) {
+        if (!shell_is_interactive()) {
+            trap_run_exit();
+            exit((int)n);
+        }
+        fprintf(stderr, "acsh: return: not in a function\n");
+        return 1;
+    }
+    control_flow_signal_return((int)n);
+    return (int)n;
 }
 
 static int builtin_break_or_continue(Command *cmd, int is_continue) {
@@ -678,13 +751,13 @@ static int builtin_break_or_continue(Command *cmd, int is_continue) {
         return 0;
     }
 
-    int level = 1;
-    if (cmd->argc > 1) {
-        level = atoi(cmd->argv[1]);
-        if (level < 1) level = 1;
+    long level = 1;
+    if (cmd->argc > 1 &&
+        parse_number(is_continue ? "continue" : "break", cmd->argv[1], 1, &level) != 0) {
+        return special_builtin_error();
     }
 
-    control_flow_signal_loop(is_continue, level);
+    control_flow_signal_loop(is_continue, (int)level);
     return 0;
 }
 
@@ -699,6 +772,10 @@ int try_run_builtin(Command *cmd, int *exit_status) {
     }
     if (strcmp(cmd->argv[0], "continue") == 0) {
         *exit_status = builtin_break_or_continue(cmd, /*is_continue=*/1);
+        return 1;
+    }
+    if (strcmp(cmd->argv[0], "return") == 0) {
+        *exit_status = builtin_return(cmd);
         return 1;
     }
 

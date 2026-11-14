@@ -9,8 +9,8 @@
 
 /* The shell needs to know which process group is currently running in
  * the foreground so that Ctrl+C/Ctrl+Z can be routed to it instead of
- * killing the shell itself. executor.c sets this before waiting on a
- * foreground pipeline, and clears it (back to 0) once it's done. */
+ * killing the shell itself. exec.c sets this before waiting on a
+ * foreground job, and clears it (back to 0) once it's done. */
 static volatile pid_t foreground_pgid = 0;
 
 void set_foreground_pgid(pid_t pgid) {
@@ -51,10 +51,12 @@ int trap_check_and_run_int(void) {
     }
     int_trap_pending = 0;
     if (int_trap_command != NULL) {
-        Chain ch;
-        if (parse_chain(int_trap_command, &ch) == 0 && ch.num_segments > 0) {
-            execute_chain(&ch);
-        }
+        /* run a copy: the trap may reset itself with `trap - INT` */
+        char *cmd = strdup(int_trap_command);
+        int saved = env_get_last_status();
+        if (cmd != NULL) run_string(cmd);
+        free(cmd);
+        env_set_last_status(saved); /* a trap does not change $? */
     }
     return 1;
 }
@@ -65,26 +67,20 @@ int trap_check_and_run_int(void) {
  * regardless of how the script got there. */
 void trap_run_exit(void) {
     if (exit_trap_command != NULL) {
-        Chain ch;
-        if (parse_chain(exit_trap_command, &ch) == 0 && ch.num_segments > 0) {
-            execute_chain(&ch);
-        }
+        /* cleared first, so an `exit` inside the trap cannot run it again */
+        char *cmd = exit_trap_command;
+        exit_trap_command = NULL;
+        run_string(cmd);
+        free(cmd);
     }
 }
 
-/* Blocks/unblocks SIGCHLD around a foreground pipeline's own waitpid()
- * loop in executor.c. This closes a real race: without it, the async
- * sigchld_handler() below can reap a foreground child (via its own
- * WNOHANG waitpid loop) BEFORE execute_pipeline()'s explicit waitpid
- * gets a chance to see it -- when that happens, execute_pipeline()'s
- * waitpid immediately fails with ECHILD ("no child to wait for") and
- * silently falls back to its initialized exit status of 0, which
- * broke &&/||/; chaining for any foreground pipeline whose last stage
- * failed (e.g. `true | false && echo x` incorrectly ran the `echo`).
- * Blocking SIGCHLD guarantees the child's death is only ever observed
- * by execute_pipeline()'s own waitpid, never stolen by the handler.
- * This is the same technique real shells (e.g. bash's job control)
- * use for this exact hazard. */
+/* Blocks/unblocks SIGCHLD around the shell's own fork()/waitpid()
+ * pairs (run_job() in exec.c, command_substitute(), fg). Without it the
+ * async sigchld_handler() below can reap a child first, the explicit
+ * waitpid() then fails with ECHILD, and the real exit status is lost
+ * (`true | false && echo x` used to run the echo). Bash uses the same
+ * technique for this hazard. */
 void block_sigchld(void) {
     sigset_t set;
     sigemptyset(&set);
@@ -110,18 +106,12 @@ static void sigchld_handler(int signo) {
     pid_t pid;
 
     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
-        pid_t pgid = getpgid(pid);
-        if (pgid < 0) {
-            /* process already fully gone; getpgid can fail here, use
-             * the pid itself as a best-effort fallback so jobs_mark_*
-             * still has something to match against. */
-            pgid = pid;
-        }
-
+        /* Jobs are found by pid, not getpgid(): a reaped process no
+         * longer has a process group to look up. */
         if (WIFSTOPPED(status)) {
-            jobs_mark_stopped(pgid);
-        } else if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            jobs_mark_done(pgid);
+            jobs_child_stopped(pid);
+        } else {
+            jobs_child_exited(pid, status);
         }
     }
 }
@@ -133,14 +123,36 @@ static void sigchld_handler(int signo) {
  * running the trap command directly here would not be async-signal-
  * safe. With no trap set and nothing in the foreground, do nothing,
  * matching how bash behaves at an empty prompt. */
+static volatile sig_atomic_t interrupted = 0;
+
+int shell_interrupted(void) {
+    return interrupted;
+}
+
+void shell_clear_interrupted(void) {
+    interrupted = 0;
+}
+
+/* A Ctrl+C reached the shell: with an INT trap set, queue the trap
+ * (run between commands; execution then goes on, as in ash); without
+ * one, mark the shell interrupted so running loops and lists stop.
+ * Only touches sig_atomic_t flags, so it is safe in the handler. */
+void shell_note_sigint(void) {
+    if (int_trap_command != NULL) {
+        int_trap_pending = 1;
+    } else {
+        interrupted = 1;
+    }
+}
+
 static void sigint_handler(int signo) {
     if (foreground_pgid > 0) {
+        /* the job gets it; if it dies of it, the executor calls
+         * shell_note_sigint() so an enclosing loop reacts too */
         kill(-foreground_pgid, signo);
         return;
     }
-    if (int_trap_command != NULL) {
-        int_trap_pending = 1;
-    }
+    shell_note_sigint();
 }
 
 /* Ctrl+Z: same idea, forward SIGTSTP to the foreground job. */

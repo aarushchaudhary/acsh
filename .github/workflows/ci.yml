@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build and comparison tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential busybox
+
+      - name: Build
+        run: make
+
+      - name: Test suite (run by acsh itself)
+        run: |
+          sed -i 's/\r$//' test_acsh.sh
+          ./acsh test_acsh.sh
+
+      - name: Differential tests against busybox ash
+        run: tests/run_diff.sh ./acsh

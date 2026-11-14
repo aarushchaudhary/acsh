@@ -5,257 +5,197 @@
 #include <ctype.h>
 #include "acsh.h"
 
-/* Must match the sentinel bytes parser.c wraps single-quoted content
- * in. They mark regions where '$' must NOT be expanded (true POSIX
- * single-quote behaviour). See parser.c's tokenizer comment for why
- * this two-pass design (tokenize, then expand) is used. */
-#define SQ_START       '\x01'
-#define SQ_END         '\x02'
-#define QUOTED_FIRST   '\x03'
-#define ESCAPED_DOLLAR '\x04'
+#include "syntax.h"  /* the marker bytes inside words */
 
 /* Returns 1 if c can appear in a shell variable name ([A-Za-z0-9_]). */
 static int is_var_char(char c) {
     return isalnum((unsigned char)c) || c == '_';
 }
 
-/* Holds the exit status of the most recently completed pipeline, so
- * $? can expand to it. Set by env_set_last_status(), called from
- * execute_chain() (executor.c) after each pipeline finishes -- this
- * is the same value POSIX shells expose as $?. */
+/* $?: the exit status of the most recently completed pipeline or
+ * compound command, set by the executor (exec.c). */
 static int last_exit_status = 0;
 
 void env_set_last_status(int status) {
     last_exit_status = status;
 }
 
-/* Getter counterpart, used by control_flow.c to read back a
- * condition/body chain's exit status without re-parsing "$?" text. */
+/* Getter counterpart, used by the executor and builtins. */
 int env_get_last_status(void) {
     return last_exit_status;
 }
 
-/* Positional parameters ($1, $2, ..., $#, $@) for the CURRENTLY
- * EXECUTING function call. Kept as a small stack (not just one global
- * set) so a function calling another function -- including itself,
- * recursively -- gets its own $1.../$# while it runs, and the outer
- * call's parameters are correctly restored once the inner call
- * returns. functions.c pushes a new frame before running a function's
- * body and pops it afterward; env_expand() below only ever reads the
- * TOP of this stack, i.e. whichever function call is innermost right
- * now. Outside of any function call, the stack is empty and $1/$@/$#
- * all expand to nothing/zero, matching a shell's top-level state. */
-static char *positional_stack[ACSH_MAX_CALL_DEPTH][ACSH_MAX_POSITIONAL_PARAMS];
-static int   positional_count_stack[ACSH_MAX_CALL_DEPTH];
-static int   positional_stack_depth = 0;
+/* One frame per running function call: its positional parameters
+ * ($1, $2, ..., $#, $@) and the variables it declared `local`, with the
+ * values they had before, restored when the call returns. Only the
+ * innermost frame is visible; outside any function there is none, and
+ * $1/$@/$# are empty. Everything is allocated per call, so neither the
+ * number of arguments nor of locals is limited. */
+typedef struct {
+    char *name;
+    char *prior_value;   /* NULL if the name was unset before */
+} LocalVar;
+
+typedef struct {
+    char    **params;
+    int       nparams;
+    LocalVar *locals;
+    int       nlocals;
+} Frame;
+
+static Frame frames[ACSH_MAX_CALL_DEPTH];
+static int   depth = 0;
+
+static char **copy_params(int argc, char *argv[]) {
+    char **params = malloc((size_t)(argc > 0 ? argc : 1) * sizeof(char *));
+    if (params == NULL) {
+        fprintf(stderr, "acsh: out of memory\n");
+        exit(2);
+    }
+    for (int i = 0; i < argc; i++) {
+        params[i] = strdup(argv[i]);
+    }
+    return params;
+}
+
+static void free_params(Frame *f) {
+    for (int i = 0; i < f->nparams; i++) {
+        free(f->params[i]);
+    }
+    free(f->params);
+    f->params = NULL;
+    f->nparams = 0;
+}
 
 void env_push_positional_params(int argc, char *argv[]) {
-    if (positional_stack_depth >= ACSH_MAX_CALL_DEPTH) {
-        /* silently cap recursion depth rather than corrupt the stack;
-         * a function this deep is almost certainly an infinite
-         * recursion bug in the script, not a legitimate use case */
-        return;
+    if (depth >= ACSH_MAX_CALL_DEPTH) {
+        return; /* function_call() refuses to recurse this deep first */
     }
-    int n = argc;
-    if (n > ACSH_MAX_POSITIONAL_PARAMS) {
-        n = ACSH_MAX_POSITIONAL_PARAMS;
-    }
-    for (int i = 0; i < n; i++) {
-        positional_stack[positional_stack_depth][i] = strdup(argv[i]);
-    }
-    positional_count_stack[positional_stack_depth] = n;
-    positional_stack_depth++;
-}
-
-/* Local variables (the `local` builtin): each function call frame
- * remembers which variable names it declared `local` and what that
- * name's value was BEFORE the call shadowed it (or that it didn't
- * exist at all), so env_pop_locals_frame() can restore the outer
- * scope's view of those names exactly when the function returns --
- * this is what makes `local x` behave like a real local variable
- * rather than a permanent change to the global environment. Uses the
- * same per-call-frame stack pattern as the positional parameter stack
- * above, pushed/popped by functions.c around each call. */
-#define ACSH_MAX_LOCALS_PER_FRAME 32
-typedef struct {
-    char name[64];
-    char *prior_value;   /* NULL if the name was unset before shadowing */
-    int   had_prior_value;
-} LocalVarEntry;
-
-static LocalVarEntry locals_stack[ACSH_MAX_CALL_DEPTH][ACSH_MAX_LOCALS_PER_FRAME];
-static int           locals_count_stack[ACSH_MAX_CALL_DEPTH];
-
-/* Called by functions.c at the same time as env_push_positional_params,
- * to start a fresh (empty) locals frame for the call about to run. */
-void env_push_locals_frame(void) {
-    /* positional_stack_depth has ALREADY been incremented by
-     * env_push_positional_params() by the time functions.c calls this
-     * (see the call order in functions.c), so the frame THIS call
-     * should use is positional_stack_depth - 1, matching how the
-     * positional parameter stack itself addresses its top frame. */
-    int frame = positional_stack_depth - 1;
-    if (frame >= 0 && frame < ACSH_MAX_CALL_DEPTH) {
-        locals_count_stack[frame] = 0;
-    }
-}
-
-/* Declares NAME as local to the CURRENT (innermost) function call,
- * remembering its old value (or absence) if this is the first time
- * THIS call has declared it local, then sets it to `value` (or
- * leaves it unset if value is NULL, for a bare `local x` with no
- * assignment). Implements the `local` builtin. Returns 0 on success,
- * 1 if called outside any function call (matching real shells, which
- * treat `local` outside a function as an error) or if this frame's
- * local-variable table is full. */
-int env_declare_local(const char *name, const char *value) {
-    if (positional_stack_depth <= 0) {
-        return 1; /* not inside a function call */
-    }
-    int frame = positional_stack_depth - 1;
-
-    /* if this call already declared `name` local earlier, don't
-     * re-save its prior value a second time -- that would end up
-     * "restoring" to the WRONG thing (the value from between the two
-     * `local` declarations, not the true outer value) when the call
-     * returns */
-    for (int i = 0; i < locals_count_stack[frame]; i++) {
-        if (strcmp(locals_stack[frame][i].name, name) == 0) {
-            if (value != NULL) {
-                setenv(name, value, 1);
-            }
-            return 0;
-        }
-    }
-
-    if (locals_count_stack[frame] >= ACSH_MAX_LOCALS_PER_FRAME) {
-        return 1;
-    }
-
-    LocalVarEntry *entry = &locals_stack[frame][locals_count_stack[frame]];
-    strncpy(entry->name, name, sizeof(entry->name) - 1);
-    entry->name[sizeof(entry->name) - 1] = '\0';
-
-    const char *existing = getenv(name);
-    if (existing != NULL) {
-        entry->prior_value = strdup(existing);
-        entry->had_prior_value = 1;
-    } else {
-        entry->prior_value = NULL;
-        entry->had_prior_value = 0;
-    }
-    locals_count_stack[frame]++;
-
-    if (value != NULL) {
-        setenv(name, value, 1);
-    } else {
-        unsetenv(name); /* bare `local x`: starts unset, not inheriting the outer value */
-    }
-
-    return 0;
-}
-
-/* Called by functions.c right before env_pop_positional_params(), to
- * restore every name this call frame declared `local` back to its
- * pre-call value (or unset it, if it had none). Must run BEFORE the
- * positional parameter stack pops, since it reads positional_stack_depth
- * to find which frame's locals to restore. */
-void env_pop_locals_frame(void) {
-    int frame = positional_stack_depth - 1;
-    if (frame < 0 || frame >= ACSH_MAX_CALL_DEPTH) {
-        return;
-    }
-    for (int i = 0; i < locals_count_stack[frame]; i++) {
-        LocalVarEntry *entry = &locals_stack[frame][i];
-        if (entry->had_prior_value) {
-            setenv(entry->name, entry->prior_value, 1);
-            free(entry->prior_value);
-        } else {
-            unsetenv(entry->name);
-        }
-        entry->prior_value = NULL;
-    }
-    locals_count_stack[frame] = 0;
-}
-
-/* Replaces the CURRENT (innermost) function call's positional
- * parameters entirely with argv[0..argc-1], discarding whatever was
- * there before. Implements `set -- ARG...`. Returns 0 on success, 1
- * if there is no active function call to replace parameters for
- * (acsh has no top-level/script positional parameters to set either,
- * since it does not model being invoked with its own argv the way a
- * script file would be). */
-int env_set_positional_params(int argc, char *argv[]) {
-    if (positional_stack_depth <= 0) {
-        return 1;
-    }
-    int top = positional_stack_depth - 1;
-
-    for (int i = 0; i < positional_count_stack[top]; i++) {
-        free(positional_stack[top][i]);
-    }
-
-    int n = argc;
-    if (n > ACSH_MAX_POSITIONAL_PARAMS) {
-        n = ACSH_MAX_POSITIONAL_PARAMS;
-    }
-    for (int i = 0; i < n; i++) {
-        positional_stack[top][i] = strdup(argv[i]);
-    }
-    positional_count_stack[top] = n;
-    return 0;
-}
-
-/* Shifts the CURRENT (innermost) function call's positional
- * parameters left by `n` -- i.e. what was $((n+1)) becomes the new
- * $1, and so on, with the first n parameters discarded. Implements
- * the `shift` builtin. Returns 0 on success, 1 if n is larger than
- * the number of parameters currently available (matching POSIX,
- * which treats shifting past the end as an error) or if called
- * outside any function call (no positional parameters to shift at
- * all -- acsh's top level has none, unlike a script invoked with its
- * own argv, which acsh does not model). */
-int env_shift_positional_params(int n) {
-    if (positional_stack_depth <= 0) {
-        return 1;
-    }
-    int top = positional_stack_depth - 1;
-    int count = positional_count_stack[top];
-    if (n < 0 || n > count) {
-        return 1;
-    }
-    for (int i = 0; i < n; i++) {
-        free(positional_stack[top][i]);
-    }
-    for (int i = 0; i < count - n; i++) {
-        positional_stack[top][i] = positional_stack[top][i + n];
-    }
-    positional_count_stack[top] = count - n;
-    return 0;
-}
-
-/* Reports how many function calls are currently nested (i.e. how many
- * frames env_push_positional_params() has pushed without a matching
- * pop yet). function_call() (functions.c) checks this BEFORE
- * recursing further, so a runaway recursive function gets a clean
- * "recursion too deep" error instead of silently exhausting the
- * real C call stack and segfaulting -- env_push_positional_params()'s
- * own cap only protects ITS storage array, not the unbounded C
- * recursion in function_call()/run_statements() that was still
- * happening past that point before this check was added. */
-int env_get_call_depth(void) {
-    return positional_stack_depth;
+    Frame *f = &frames[depth++];
+    f->params = copy_params(argc, argv);
+    f->nparams = argc;
+    f->locals = NULL;
+    f->nlocals = 0;
 }
 
 void env_pop_positional_params(void) {
-    if (positional_stack_depth <= 0) {
+    if (depth > 0) {
+        free_params(&frames[--depth]);
+    }
+}
+
+/* Starts the (empty) locals of the call just pushed. */
+void env_push_locals_frame(void) {
+    if (depth > 0) {
+        frames[depth - 1].locals = NULL;
+        frames[depth - 1].nlocals = 0;
+    }
+}
+
+/* `local NAME[=value]`: remembers NAME's current value (only the first
+ * time this call declares it, so the true outer value comes back) and
+ * sets it, or unsets it for a bare `local x`. Returns 1 outside a
+ * function, as real shells do. */
+int env_declare_local(const char *name, const char *value) {
+    if (depth <= 0) {
+        return 1;
+    }
+    Frame *f = &frames[depth - 1];
+    int known = 0;
+    for (int i = 0; i < f->nlocals; i++) {
+        if (strcmp(f->locals[i].name, name) == 0) {
+            known = 1;
+            break;
+        }
+    }
+    if (!known) {
+        LocalVar *bigger = realloc(f->locals, (size_t)(f->nlocals + 1) * sizeof(LocalVar));
+        if (bigger == NULL) {
+            return 1;
+        }
+        f->locals = bigger;
+        const char *existing = getenv(name);
+        f->locals[f->nlocals].name = strdup(name);
+        f->locals[f->nlocals].prior_value = existing != NULL ? strdup(existing) : NULL;
+        f->nlocals++;
+    }
+    if (value != NULL) {
+        setenv(name, value, 1);
+    } else if (!known) {
+        unsetenv(name);
+    }
+    return 0;
+}
+
+/* Restores every variable the returning call declared local. Called
+ * before env_pop_positional_params(). */
+void env_pop_locals_frame(void) {
+    if (depth <= 0) {
         return;
     }
-    positional_stack_depth--;
-    int n = positional_count_stack[positional_stack_depth];
-    for (int i = 0; i < n; i++) {
-        free(positional_stack[positional_stack_depth][i]);
+    Frame *f = &frames[depth - 1];
+    for (int i = 0; i < f->nlocals; i++) {
+        LocalVar *v = &f->locals[i];
+        if (v->prior_value != NULL) {
+            setenv(v->name, v->prior_value, 1);
+        } else {
+            unsetenv(v->name);
+        }
+        free(v->name);
+        free(v->prior_value);
     }
+    free(f->locals);
+    f->locals = NULL;
+    f->nlocals = 0;
+}
+
+/* `set -- ARG...`: replaces the current call's parameters. Returns 1
+ * outside a function (acsh has no top-level parameters yet). */
+int env_set_positional_params(int argc, char *argv[]) {
+    if (depth <= 0) {
+        return 1;
+    }
+    Frame *f = &frames[depth - 1];
+    char **params = copy_params(argc, argv); /* before freeing: argv may be $@ itself */
+    free_params(f);
+    f->params = params;
+    f->nparams = argc;
+    return 0;
+}
+
+/* `shift [n]`. Returns 1 if n exceeds the parameters there are, or
+ * outside a function. */
+int env_shift_positional_params(int n) {
+    if (depth <= 0) {
+        return 1;
+    }
+    Frame *f = &frames[depth - 1];
+    if (n < 0 || n > f->nparams) {
+        return 1;
+    }
+    for (int i = 0; i < n; i++) {
+        free(f->params[i]);
+    }
+    memmove(f->params, f->params + n, (size_t)(f->nparams - n) * sizeof(char *));
+    f->nparams -= n;
+    return 0;
+}
+
+int env_positional_count(void) {
+    return depth > 0 ? frames[depth - 1].nparams : 0;
+}
+
+const char *env_positional(int i) {
+    if (i < 1 || i > env_positional_count()) {
+        return "";
+    }
+    return frames[depth - 1].params[i - 1];
+}
+
+/* How many function calls are nested; function_call() refuses to go
+ * deeper than ACSH_MAX_CALL_DEPTH instead of exhausting the C stack. */
+int env_get_call_depth(void) {
+    return depth;
 }
 
 char *env_expand(const char *word) {
@@ -302,19 +242,17 @@ char *env_expand(const char *word) {
         }
 
         while (*p != '\0') {
-            if (*p == SQ_START) {
-                in_single_quotes = 1;
-                p++;
-                continue;
-            }
-            if (*p == SQ_END) {
-                in_single_quotes = 0;
-                p++;
+            /* quote markers are kept in the output: glob_expand() needs
+             * them to leave quoted characters alone, and removes them */
+            if (*p == SQ_START || *p == SQ_END) {
+                in_single_quotes = (*p == SQ_START);
+                if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+                out[len++] = *p++;
                 continue;
             }
 
             if (*p == ESCAPED_DOLLAR) {
-                /* \$ inside "..." (see parser.c's read_word): always a
+                /* \$ inside "..." (see lexer.c's scan_word): always a
                  * literal '$', NEVER the start of a variable reference. */
                 if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
                 out[len++] = '$';
@@ -413,10 +351,9 @@ char *env_expand(const char *word) {
                  * parameter is simply empty, not an error). */
                 int idx = *(p + 1) - '1'; /* $1 -> index 0 */
                 p += 2;
-                if (positional_stack_depth > 0) {
-                    int top = positional_stack_depth - 1;
-                    if (idx < positional_count_stack[top]) {
-                        const char *val = positional_stack[top][idx];
+                if (idx < env_positional_count()) {
+                    {
+                        const char *val = env_positional(idx + 1);
                         size_t vlen = strlen(val);
                         while (len + vlen + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
                         memcpy(out + len, val, vlen);
@@ -430,8 +367,7 @@ char *env_expand(const char *word) {
                 /* $# -- number of positional parameters passed to the
                  * innermost currently-executing function call. */
                 p += 2;
-                int count = (positional_stack_depth > 0)
-                ? positional_count_stack[positional_stack_depth - 1] : 0;
+                int count = env_positional_count();
                 char count_str[16];
                 int count_len = snprintf(count_str, sizeof(count_str), "%d", count);
                 if (count_len > 0) {
@@ -449,15 +385,14 @@ char *env_expand(const char *word) {
                  * quotes expands to separate individually-quoted words;
                  * acsh always joins them with a single space here.) */
                 p += 2;
-                if (positional_stack_depth > 0) {
-                    int top = positional_stack_depth - 1;
-                    int count = positional_count_stack[top];
+                {
+                    int count = env_positional_count();
                     for (int i = 0; i < count; i++) {
                         if (i > 0) {
                             if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
                             out[len++] = ' ';
                         }
-                        const char *val = positional_stack[top][i];
+                        const char *val = env_positional(i + 1);
                         size_t vlen = strlen(val);
                         while (len + vlen + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
                         memcpy(out + len, val, vlen);
@@ -504,9 +439,8 @@ char *env_expand(const char *word) {
                 while (is_var_char(*p)) p++;
                 name_len = (size_t)(p - name_start);
             } else {
-                /* '$' not followed by a valid name (e.g. "$" alone, or
-                 * "$5", or "$@") -- just emit the '$' literally for now.
-                 * Positional/special parameters are out of scope. */
+                /* '$' not followed by a name or a parameter acsh knows
+                 * (e.g. "$" alone, "$$", "$!"): emitted literally. */
                 if (len + 1 >= cap) {
                     cap *= 2;
                     out = realloc(out, cap);
