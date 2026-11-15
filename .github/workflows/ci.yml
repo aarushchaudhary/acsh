@@ -14,7 +14,7 @@ jobs:
       - name: Install build and comparison tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential busybox
+          sudo apt-get install -y build-essential busybox autoconf
 
       - name: Build
         run: make
@@ -29,6 +29,12 @@ jobs:
 
       - name: Interactive tests on a pty
         run: make tests/pty/pty_test && tests/pty/pty_test ./acsh
+
+      - name: Real-world scripts (init scripts, ./configure) against busybox ash
+        run: tests/realworld/run.sh ./acsh
+
+      - name: Bash extras (here-strings, brace expansion, printf %q) against bash
+        run: tests/bash_extras/run.sh ./acsh
 
   sanitizers:
     name: AddressSanitizer + UndefinedBehaviorSanitizer
@@ -114,6 +120,49 @@ jobs:
             timeout-*
             oom-*
 
+  bench:
+    name: Benchmarks against a standalone static ash (Alpine, musl)
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    env:
+      BUSYBOX: busybox-1.36.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: apk add --no-cache build-base linux-headers perl busybox
+
+      - name: Build acsh, full and minimal, as released (static, musl, -Os)
+        run: |
+          make static && mv acsh-static acsh-full-static
+          make static MINIMAL=1 && mv acsh-static acsh-min-static
+
+      - name: Build a standalone static ash from busybox (ash only, Alpine-like features)
+        run: |
+          wget -q https://busybox.net/downloads/$BUSYBOX.tar.bz2 https://busybox.net/downloads/$BUSYBOX.tar.bz2.sha256
+          sha256sum -c $BUSYBOX.tar.bz2.sha256
+          tar xjf $BUSYBOX.tar.bz2
+          cd $BUSYBOX
+          make allnoconfig >/dev/null
+          for opt in STATIC ASH SH_IS_ASH ASH_OPTIMIZE_FOR_SIZE ASH_INTERNAL_GLOB ASH_BASH_COMPAT \
+                     ASH_JOB_CONTROL ASH_ALIAS ASH_RANDOM_SUPPORT ASH_EXPAND_PRMT ASH_ECHO ASH_PRINTF \
+                     ASH_TEST ASH_HELP ASH_GETOPTS ASH_CMDCMD FEATURE_SH_MATH FEATURE_SH_MATH_64 \
+                     FEATURE_EDITING FEATURE_EDITING_SAVEHISTORY FEATURE_TAB_COMPLETION \
+                     FEATURE_EDITING_FANCY_PROMPT FEATURE_SH_HISTFILESIZE; do
+            sed -i "s/^# CONFIG_$opt is not set/CONFIG_$opt=y/" .config
+          done
+          yes '' | make oldconfig >/dev/null
+          make -j"$(nproc)" >/dev/null
+          strip busybox
+          cp busybox ../ash-static
+          cd ..
+          ./ash-static ash -c 'echo standalone ash works: $((6*7))'
+
+      - name: Size, idle memory and 1,000 runs of -c true (gate checked)
+        run: |
+          ln -s "$PWD/ash-static" ./ash
+          CHECK=1 tests/bench/bench.sh "ash=./ash" "acsh-min=./acsh-min-static" "acsh=./acsh-full-static"
+
   alpine:
     name: Alpine (musl, real busybox ash)
     runs-on: ubuntu-latest
@@ -122,7 +171,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build tools
-        run: apk add --no-cache build-base busybox
+        run: apk add --no-cache build-base busybox openrc abuild autoconf
 
       - name: Build (dynamic and static)
         run: |
@@ -140,6 +189,12 @@ jobs:
 
       - name: Interactive tests on a pty (as root, with /etc/acshrc and su)
         run: make tests/pty/pty_test && tests/pty/pty_test ./acsh
+
+      - name: Real-world scripts (/etc/profile, OpenRC init scripts, abuild, ./configure) against Alpine's ash
+        run: tests/realworld/run.sh ./acsh
+
+      - name: Community re-check on the release build (static, musl)
+        run: tests/complaints.sh ./acsh-static
 
       - name: Alpine's /etc/profile runs cleanly in a login shell
         run: |

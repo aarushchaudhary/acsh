@@ -188,8 +188,9 @@ char **var_environ(void) {
     return env;
 }
 
-/* Writes value in single quotes, as ash does ('it'"'"'s' for it's). */
-static void print_quoted(const char *value) {
+/* Writes value in single quotes, as ash does ('it'"'"'s' for it's):
+ * for set, export -p, readonly -p, alias and trap listings. */
+void print_single_quoted(const char *value) {
     putchar('\'');
     for (const char *s = value; *s; s++) {
         if (*s == '\'') fputs("'\"'\"'", stdout);
@@ -222,7 +223,7 @@ void var_print(int which) {
         fputs(v->name, stdout);
         if (v->value != NULL) {
             putchar('=');
-            print_quoted(v->value);
+            print_single_quoted(v->value);
         }
         putchar('\n');
     }

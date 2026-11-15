@@ -37,6 +37,7 @@ static int    base = 1;     /* the number of items[0], for `history` and fc */
 static int    saved;        /* items[0, saved) are already in the file */
 static int    open_entry;   /* the newest entry is still being typed (more lines may come) */
 static off_t  file_read_to; /* history -n: the file's bytes up to here were read */
+static int    running = 0;  /* the number of the entry for the command line now running; 0: none */
 
 static int histsize(void) {
     const char *v = var_get("HISTSIZE");
@@ -288,6 +289,7 @@ static int ignored_by_pattern(const char *line) {
 
 void history_begin(const char *line) {
     open_entry = 0;
+    running = 0;
     flush_file();  /* the previous command is complete now */
     if (*line == '\0' || histsize() == 0) return;
     if ((*line == ' ' || *line == '\t') && control_has("ignorespace")) return;
@@ -301,6 +303,7 @@ void history_begin(const char *line) {
     char *copy = strdup(line);
     if (copy == NULL) return;
     push(copy);
+    running = base + count - 1;
     open_entry = 1;
 }
 
@@ -467,10 +470,11 @@ int fc_builtin(int argc, char **argv) {
             }
         }
     }
-    /* the fc line itself is the newest entry: it is never an operand,
-     * and with -s or an edit it is replaced by what runs */
-    int last = count - 1;
-    if (last >= 0 && strncmp(items[last], "fc", 2) == 0 && (items[last][2] == '\0' || items[last][2] == ' ')) last--;
+    /* the line fc was typed on (as fc, through an alias such as
+     * r='fc -s', or as FCEDIT=... fc) is never an operand, or fc would
+     * run itself again; with -s or an edit, what runs replaces it */
+    int self = (running != 0 && running == base + count - 1) ? count - 1 : -1;
+    int last = count - 1 - (self >= 0);
     if (last < 0) {
         shell_error("fc: history is empty\n");
         return 1;
@@ -504,7 +508,7 @@ int fc_builtin(int argc, char **argv) {
             run = strdup(cmd);
         }
         free(pair);
-        if (last == count - 2) remove_at(count - 1);  /* drop the fc line */
+        if (self >= 0) remove_at(self);  /* the fc line gives way to what runs */
         printf("%s\n", run);
         fflush(stdout);
         open_entry = 0;
@@ -576,7 +580,7 @@ int fc_builtin(int argc, char **argv) {
         if (text != NULL) {
             text[tl] = '\0';
             while (tl > 0 && text[tl - 1] == '\n') text[--tl] = '\0';
-            if (last == count - 2) remove_at(count - 1);
+            if (self >= 0) remove_at(self);
             printf("%s\n", text);
             fflush(stdout);
             open_entry = 0;

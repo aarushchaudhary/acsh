@@ -56,9 +56,6 @@ int  lex_expand_alias(Lexer *lx, const Token *t);
 /* Starts a new complete command: drops consumed input. */
 void lex_begin_command(Lexer *lx);
 
-/* After a syntax error: drops the rest of the current input line(s). */
-void lex_discard(Lexer *lx);
-
 /* Prints "acsh: [name: line N: ]syntax error: <msg>" for position pos,
  * plus "  acsh: usage:  <usage>" when usage is not NULL. */
 void lex_syntax_error(Lexer *lx, size_t pos, const char *usage, const char *fmt, ...);

@@ -20,9 +20,6 @@
  *   jobs.c       the job table                  signals.c: SIGCHLD/SIGINT/SIGTSTP, traps
  *   alias.c      aliases                        history.c: command history */
 
-#define ACSH_MAX_ALIASES   32     /* aliases stored */
-#define ACSH_MAX_JOBS      32     /* background/stopped jobs tracked at once */
-#define ACSH_MAX_FUNCTIONS 64     /* shell functions defined at once */
 #define ACSH_MAX_CALL_DEPTH 1000  /* nested function calls (recursion limit) */
 #define ACSH_MAX_NESTING    256   /* nested ${...} or $(...) inside one another */
 
@@ -155,8 +152,8 @@ void jobs_cleanup_done(void);
 Job *jobs_resolve(const char *spec);
 Job *jobs_find_by_id(int id);      /* job "%id", or NULL */
 Job *jobs_find_by_pid(pid_t pid);  /* the job a process belongs to, or NULL */
-Job *jobs_at(int index);           /* slot 0..ACSH_MAX_JOBS-1 if in use, else NULL */
-Job *jobs_find_most_recent(void);  /* newest job, or NULL */
+int  jobs_capacity(void);           /* slots in the job table (it grows) */
+Job *jobs_at(int index);           /* slot 0..jobs_capacity()-1 if in use, else NULL */
 void jobs_print_all(int with_pid, int pids_only);  /* jobs, jobs -l, jobs -p */
 
 /* Job control (interactive shells only): on a terminal the shell takes
@@ -327,13 +324,8 @@ int  function_call(int argc, char *argv[]);
  * ~/.acshrc can override them. An alias is expanded once (an alias
  * that starts with its own name does not loop). */
 
-typedef struct {
-    char name[64];
-    char value[256];
-    int  in_use;
-} Alias;
-
 void alias_load_defaults(void);
+void print_single_quoted(const char *s); /* 'value', a ' inside as '"'"' (vars.c) */
 void alias_set(const char *name, const char *value);
 void alias_unset(const char *name);
 const char *alias_get(const char *name);

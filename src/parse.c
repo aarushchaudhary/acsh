@@ -274,13 +274,6 @@ void node_unref(Node *n) {
 static Node *parse_list(Parser *p, int top);
 static Node *parse_command(Parser *p);
 
-static int is_name(const char *s) {
-    if (!(isalpha((unsigned char)*s) || *s == '_')) return 0;
-    for (s++; *s; s++) {
-        if (!(isalnum((unsigned char)*s) || *s == '_')) return 0;
-    }
-    return 1;
-}
 
 /* NAME=value with an unquoted name: a variable assignment. */
 static int is_assignment(const char *w) {
@@ -543,7 +536,7 @@ static Node *parse_for(Parser *p) {
     drop(p); /* for */
     Node *n = node_new(N_FOR);
     Token *t = peek(p);
-    if (p->failed || t->type != T_WORD || t->quoted || !is_name(t->text)) {
+    if (p->failed || t->type != T_WORD || t->quoted || !var_valid_name(t->text)) {
         fail(p, FOR_USAGE, "expected a variable name after 'for'");
         return n;
     }
@@ -741,11 +734,11 @@ static Node *parse_command_at(Parser *p) {
         if (!w.quoted && strcmp(w.text, "[[") == 0) {
             return parse_dbracket(p, w.text);
         }
-        if (!w.quoted && is_name(w.text) && peek(p)->type == T_LPAREN) {
+        if (!w.quoted && var_valid_name(w.text) && peek(p)->type == T_LPAREN) {
             return parse_funcdef(p, w.text, 0);
         }
         if (!w.quoted && strcmp(w.text, "select") == 0 && peek(p)->type == T_WORD &&
-            !peek(p)->quoted && is_name(peek(p)->text)) {
+            !peek(p)->quoted && var_valid_name(peek(p)->text)) {
             free(w.text);
             return fail(p, "while printf '1) a  2) b: ' && read -r n; do case $n in 1) ...;; 2) ...;; esac; done",
                         "select is a bash feature; use a while loop with read");
@@ -754,7 +747,7 @@ static Node *parse_command_at(Parser *p) {
             /* function NAME [()] BODY, as in ash, bash and ksh */
             Token name = take(p);
             free(w.text);
-            if (name.quoted || !is_name(name.text)) {
+            if (name.quoted || !var_valid_name(name.text)) {
                 free(name.text);
                 return fail(p, "function NAME { COMMANDS; }", "expected a function name after 'function'");
             }

@@ -509,6 +509,9 @@ check_eq "interactive shell runs \$ENV" "[yes]" "$RESULT"
 RESULT=$(echo 'echo "[$X_FROM_ENV]"' | ENV=/tmp/acsh_test_env.sh ./acsh 2>/dev/null)
 check_eq "a non-interactive shell does not" "[]" "$RESULT"
 rm -f /tmp/acsh_test_env.sh
+RESULT=$(echo 'echo "[$PS1]"; env | grep -c "^PS1="' | ./acsh -i 2>/dev/null | tr '\n' ' ')
+check_eq "an interactive shell sets PS1 (not exported), so [ \"\$PS1\" ] works in profiles" "[acsh:\\w\\g\\\$ ] 0 " "$RESULT"
+check_eq "a script leaves PS1 unset" "[unset]" "$(./acsh -c 'echo "[${PS1-unset}]"')"
 RESULT=$(env -i ./acsh -c 'echo "$PATH"')
 check_eq "an unset PATH gets ash's default" "/sbin:/usr/sbin:/bin:/usr/bin" "$RESULT"
 RESULT=$(echo "$EPOCHSECONDS" | grep -c '^[0-9][0-9]*$')
@@ -616,6 +619,40 @@ check_eq "set +B turns brace expansion off" "{a,b}" "$(set +B; echo {a,b})"
 check_eq "printf %q quotes as bash does" "a\\ b it\\'s \\\$x '' \$'t\\tx'" "$(printf '%q ' 'a b' "it's" '$x' '' "$(printf 't\tx')" | sed 's/ $//')"
 RESULT=$(eval "y=$(printf %q "a b \$c 'd'")"; echo "$y")
 check_eq "printf %q output reads back unchanged" "a b \$c 'd'" "$RESULT"
+
+echo ""
+echo "[4.3] Known ash crash inputs (tests/crash): each runs to the end"
+for crash in tests/crash/*.sh; do
+    RESULT=$(timeout 120 ./acsh "$crash" 2>/dev/null | tail -1)
+    check_eq "$(basename "$crash") runs to the end" "survived" "$RESULT"
+done
+
+echo ""
+echo "[4.7] Audit fixes"
+HDIR=/tmp/acsh_audit_test; rm -rf $HDIR; mkdir -p $HDIR
+RESULT=$(printf 'echo hi\nalias r="fc -s"\nr\n' | HOME=$HDIR timeout 10 ./acsh -i 2>/dev/null | grep -c '^alias r=')
+check_eq "alias r='fc -s' re-runs the previous command once, not itself" "1" "$RESULT"
+RESULT=$(printf 'echo apple\nFCEDIT="sed -i s/apple/banana/" fc\n' | HOME=$HDIR timeout 10 ./acsh -i 2>/dev/null | grep -c banana)
+check_eq "FCEDIT=... fc edits and runs the previous command once" "2" "$RESULT"
+RESULT=$(./acsh -c 'i=0; while [ $i -lt 500 ]; do eval "f$i() { echo f$i; }"; alias a$i=x; i=$((i+1)); done; f499; alias | wc -l')
+check_eq "500 functions and 500 aliases" "f499 500" "$(echo $RESULT)"
+LONGV=$(head -c 1000 /dev/zero | tr '\0' x)
+check_eq "an alias value of 1,000 characters is kept whole" "1008" "$(./acsh -c "alias long='$LONGV'; alias long" | wc -c | tr -d ' ')"
+RESULT=$(./acsh -c 'i=0; while [ $i -lt 40 ]; do sleep 0.3 & i=$((i+1)); done; (exit 7) & wait $!; echo "st=$?"' 2>&1)
+check_eq "wait \$! after 40 background jobs gives the job's status" "st=7" "$RESULT"
+RESULT=$(./acsh -c 'n() { ls /proc/$$/fd | wc -l; }; a=$(n); i=0; while [ $i -lt 50 ]; do cat <(echo x) >/dev/null; i=$((i+1)); done; b=$(n); echo $((b - a))')
+check_eq "process substitution leaks no file descriptors (50 uses)" "0" "$RESULT"
+rm -f $HDIR/.acsh_history
+( printf 'echo one\nsleep 1\nhistory -n\nhistory\n' | HOME=$HDIR ./acsh -i 2>/dev/null > $HDIR/a.out ) &
+sleep 0.3
+printf 'echo from-other-session\n' | HOME=$HDIR ./acsh -i >/dev/null 2>&1
+wait
+check_eq "history -n reads in what another session added" "1" "$(grep -c from-other-session $HDIR/a.out)"
+LONGN=$(head -c 300 /dev/zero | tr '\0' v)
+RESULT=$(./acsh -c "$LONGN=long; echo \"\$$LONGN \${#$LONGN}\" \$(($LONGN=5)) \$(($LONGN+1)) \$(($LONGN+=2)); f() { local $LONGN=in; echo \$$LONGN; }; f")
+check_eq "a 300-character variable name works in \$name, \${#name}, arithmetic and local" "long 4 5 6 7 in" "$(echo $RESULT)"
+
+rm -rf $HDIR
 
 echo ""
 echo "=================================================="

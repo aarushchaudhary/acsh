@@ -22,13 +22,16 @@ all: $(TARGET)
 $(TARGET): $(SRC) $(HDR) .build-flags
 	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
 
-# A self-contained binary (no shared libraries), size-optimized and
-# stripped. Meant for musl: on Alpine plain `make static`; on a glibc
-# system install musl-tools and run `make static CC=musl-gcc`.
+# A self-contained binary (no shared libraries), built for size and
+# stripped: the release build. Meant for musl: on Alpine plain
+# `make static` (MINIMAL=1 works too); on a glibc system install
+# musl-tools and run `make static CC=musl-gcc`.
+SIZEFLAGS = -Os -ffunction-sections -fdata-sections -Wl,--gc-sections \
+            -fno-asynchronous-unwind-tables -fno-unwind-tables
 static: acsh-static
 
 acsh-static: $(SRC) $(HDR) .build-flags
-	$(CC) $(CFLAGS) -Os -static -s -o acsh-static $(SRC)
+	$(CC) $(CFLAGS) $(SIZEFLAGS) -static -s -o acsh-static $(SRC)
 
 # libFuzzer targets (clang): the parser, and expansion with command
 # substitution switched off. Run e.g. ./fuzz_parse -max_total_time=60 corpus/
@@ -50,8 +53,14 @@ check: $(TARGET) tests/pty/pty_test
 	./$(TARGET) test_acsh.sh
 	tests/run_diff.sh ./$(TARGET)
 	tests/pty/pty_test $(if $(filter 1,$(MINIMAL)),--minimal) ./$(TARGET)
+	tests/bash_extras/run.sh ./$(TARGET)
+	tests/realworld/run.sh ./$(TARGET)
+
+# The community re-check on the release build: one row per complaint.
+recheck: static
+	tests/complaints.sh ./acsh-static $(if $(filter 1,$(MINIMAL)),--minimal)
 
 clean:
 	rm -f $(TARGET) acsh-static fuzz_parse fuzz_expand .build-flags tests/pty/pty_test
 
-.PHONY: all static fuzz check clean FORCE
+.PHONY: all static fuzz check recheck clean FORCE

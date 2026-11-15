@@ -9,7 +9,13 @@
  * updates state fields of slots in use (jobs_child_exited/stopped);
  * slots are added and freed outside the handler, with SIGCHLD blocked. */
 
-static Job job_table[ACSH_MAX_JOBS];
+/* The table grows as needed. Each Job is its own allocation and never
+ * moves or is freed (a finished slot is reused), so a Job * held by fg
+ * or wait stays valid even if a trap starts another job meanwhile. Only
+ * jobs_add() grows the table, with SIGCHLD blocked, so the handler never
+ * sees it half-grown. */
+static Job **job_table = NULL;
+static int   job_cap = 0;
 static volatile sig_atomic_t changes_pending = 0;
 static int sequence = 0;  /* recency: higher = more recently started or stopped */
 
@@ -26,16 +32,38 @@ static void job_free(Job *j) {
 static int lowest_free_id(void) {
     for (int id = 1;; id++) {
         int used = 0;
-        for (int i = 0; i < ACSH_MAX_JOBS; i++) {
-            if (job_table[i].in_use && job_table[i].id == id) used = 1;
+        for (int i = 0; i < job_cap; i++) {
+            if (job_table[i]->in_use && job_table[i]->id == id) used = 1;
         }
         if (!used) return id;
     }
 }
 
+/* Adds a free slot at the end of the table; -1 if out of memory. */
+static int grow_table(void) {
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &block, &old);
+    int ncap = job_cap ? job_cap * 2 : 16;
+    Job **bigger = realloc(job_table, (size_t)ncap * sizeof(Job *));
+    int ok = bigger != NULL;
+    if (ok) {
+        job_table = bigger;
+        for (int i = job_cap; i < ncap; i++) {
+            job_table[i] = calloc(1, sizeof(Job));
+            if (job_table[i] == NULL) { ncap = i; ok = i > job_cap; break; }
+        }
+        job_cap = ncap;
+    }
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    return ok ? 0 : -1;
+}
+
 int jobs_add(pid_t pgid, pid_t pids[], int num_pids, const char *cmdline) {
-    for (int i = 0; i < ACSH_MAX_JOBS; i++) {
-        Job *j = &job_table[i];
+    for (int i = 0; i <= job_cap; i++) {
+        if (i == job_cap && grow_table() != 0) break;
+        Job *j = job_table[i];
         if (j->in_use) continue;
         j->pids = malloc((size_t)num_pids * sizeof(pid_t));
         j->cmdline = strdup(cmdline);
@@ -58,20 +86,20 @@ int jobs_add(pid_t pgid, pid_t pids[], int num_pids, const char *cmdline) {
         j->in_use = 1; /* last: the handler only looks at slots in use */
         return j->id;
     }
-    shell_error("job table full\n");
+    shell_error("out of memory: cannot track the job\n");
     return -1;
 }
 
 static Job *find_by_pgid(pid_t pgid) {
-    for (int i = 0; i < ACSH_MAX_JOBS; i++) {
-        if (job_table[i].in_use && job_table[i].pgid == pgid) return &job_table[i];
+    for (int i = 0; i < job_cap; i++) {
+        if (job_table[i]->in_use && job_table[i]->pgid == pgid) return job_table[i];
     }
     return NULL;
 }
 
 static Job *find_by_pid(pid_t pid) {
-    for (int i = 0; i < ACSH_MAX_JOBS; i++) {
-        Job *j = &job_table[i];
+    for (int i = 0; i < job_cap; i++) {
+        Job *j = job_table[i];
         if (!j->in_use) continue;
         for (int k = 0; k < j->num_pids; k++) {
             if (j->pids[k] == pid) return j;
@@ -85,15 +113,19 @@ Job *jobs_find_by_pid(pid_t pid) {
 }
 
 Job *jobs_find_by_id(int id) {
-    for (int i = 0; i < ACSH_MAX_JOBS; i++) {
-        if (job_table[i].in_use && job_table[i].id == id) return &job_table[i];
+    for (int i = 0; i < job_cap; i++) {
+        if (job_table[i]->in_use && job_table[i]->id == id) return job_table[i];
     }
     return NULL;
 }
 
+int jobs_capacity(void) {
+    return job_cap;
+}
+
 Job *jobs_at(int index) {
-    if (index < 0 || index >= ACSH_MAX_JOBS || !job_table[index].in_use) return NULL;
-    return &job_table[index];
+    if (index < 0 || index >= job_cap || !job_table[index]->in_use) return NULL;
+    return job_table[index];
 }
 
 void jobs_child_exited(pid_t pid, int status) {
@@ -145,8 +177,8 @@ static int ranks_above(const Job *a, const Job *b) {
 
 static Job *ranked(int rank) {
     Job *first = NULL, *second = NULL;
-    for (int i = 0; i < ACSH_MAX_JOBS; i++) {
-        Job *j = &job_table[i];
+    for (int i = 0; i < job_cap; i++) {
+        Job *j = job_table[i];
         if (!j->in_use) continue;
         if (ranks_above(j, first)) {
             second = first;
@@ -156,10 +188,6 @@ static Job *ranked(int rank) {
         }
     }
     return rank == 0 ? first : second;
-}
-
-Job *jobs_find_most_recent(void) {
-    return ranked(0);
 }
 
 Job *jobs_resolve(const char *spec) {
@@ -176,8 +204,8 @@ Job *jobs_resolve(const char *spec) {
     int contains = (*s == '?');
     if (contains) s++;
     Job *found = NULL;
-    for (int i = 0; i < ACSH_MAX_JOBS; i++) {
-        Job *j = &job_table[i];
+    for (int i = 0; i < job_cap; i++) {
+        Job *j = job_table[i];
         if (!j->in_use) continue;
         int match = contains ? strstr(j->cmdline, s) != NULL : strncmp(j->cmdline, s, strlen(s)) == 0;
         if (match) {
@@ -215,8 +243,8 @@ void jobs_report_changes(void) {
     if (!changes_pending) return;
     block_sigchld(); /* the handler must not change the table mid-scan */
     changes_pending = 0;
-    for (int i = 0; i < ACSH_MAX_JOBS; i++) {
-        Job *j = &job_table[i];
+    for (int i = 0; i < job_cap; i++) {
+        Job *j = job_table[i];
         if (!j->in_use || !j->notify) continue;
         j->notify = 0;
         if (shell_is_interactive()) print_job(j, 0);
@@ -227,20 +255,21 @@ void jobs_report_changes(void) {
 }
 
 void jobs_cleanup_done(void) {
-    for (int i = 0; i < ACSH_MAX_JOBS; i++) {
-        if (job_table[i].in_use && job_table[i].state == JOB_DONE) job_free(&job_table[i]);
+    for (int i = 0; i < job_cap; i++) {
+        if (job_table[i]->in_use && job_table[i]->state == JOB_DONE) job_free(job_table[i]);
     }
 }
 
 void jobs_print_all(int with_pid, int pids_only) {
     block_sigchld();
-    Job *order[ACSH_MAX_JOBS];
+    Job **order = malloc((size_t)(job_cap + 1) * sizeof(Job *));
+    if (order == NULL) { unblock_sigchld(); return; }
     int n = 0;
     Job *cur = ranked(0), *prev = ranked(1);
     if (cur) order[n++] = cur;
     if (prev) order[n++] = prev;
-    for (int i = 0; i < ACSH_MAX_JOBS; i++) {
-        Job *j = &job_table[i];
+    for (int i = 0; i < job_cap; i++) {
+        Job *j = job_table[i];
         if (j->in_use && j != cur && j != prev) order[n++] = j;
     }
     for (int k = 0; k < n; k++) {
@@ -249,6 +278,7 @@ void jobs_print_all(int with_pid, int pids_only) {
         order[k]->notify = 0;
     }
     fflush(stdout);
+    free(order);
     jobs_cleanup_done(); /* finished jobs are shown once, then forgotten */
     unblock_sigchld();
 }

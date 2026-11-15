@@ -156,7 +156,7 @@ char *prompt_expand(const char *ps) {
         case '?': snprintf(buf, 32, "%d", env_get_last_status()); tquote(&t, buf); break;
         case 'j': {
             int n = 0;
-            for (int i = 0; i < ACSH_MAX_JOBS; i++) if (jobs_at(i) != NULL) n++;
+            for (int i = 0; i < jobs_capacity(); i++) if (jobs_at(i) != NULL) n++;
             snprintf(buf, 32, "%d", n);
             tquote(&t, buf);
             break;
@@ -219,7 +219,7 @@ char *prompt_expand(const char *ps) {
 
 char *prompt_string(const char *which) {
     const char *ps = var_get(which);
-    if (ps == NULL) ps = strcmp(which, "PS1") == 0 ? "acsh:\\w\\g\\$ " : "> ";
+    if (ps == NULL) ps = strcmp(which, "PS1") == 0 ? "acsh:\\w\\g\\$ " : "> ";  /* unset by the user */
     if (strcmp(which, "PS1") == 0) command_number++;
     return prompt_expand(ps);
 }

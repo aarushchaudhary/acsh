@@ -138,10 +138,6 @@ void lex_discard(Lexer *lx) {
     drop_heredocs(lx); /* their redirections were freed with the failed command */
 }
 
-void lex_discard_input(Lexer *lx) {
-    lex_discard(lx);
-}
-
 int lex_line_at(Lexer *lx, size_t pos) {
     if (pos > lx->len) pos = lx->len;
     if (pos < lx->line_pos) {         /* behind the cache (text was replaced): recount */

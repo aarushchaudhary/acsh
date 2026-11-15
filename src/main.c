@@ -391,6 +391,9 @@ int main(int argc, char *argv[]) {
     }
     if (interactive) {
         alias_load_defaults();  /* first, so profiles and ~/.acshrc can override them */
+        /* PS1 is set only in interactive shells (as bash does), so the
+         * common test [ "$PS1" ] in a profile tells them from scripts */
+        if (var_get("PS1") == NULL) var_set("PS1", "acsh:\\w\\g\\$ ");
     }
     if (login) {
         load_login_profiles();
@@ -428,7 +431,7 @@ int main(int argc, char *argv[]) {
             /* Ctrl+C stopped a command, or cancelled one being typed:
              * drop the rest of what was typed */
             shell_clear_interrupted();
-            lex_discard_input(lx);
+            lex_discard(lx);
             env_set_last_status(130);
             continue;
         }

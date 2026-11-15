@@ -13,7 +13,8 @@ that Ubuntu and Alpine ship (1.36).
 roadmap), and phase 3 made it a daily-driver interactive shell: a line
 editor with history search, Tab completion, bash-style prompts, history
 done right, startup files that work under `su` and `docker exec`, and a
-hardened core (fuzzed, sanitizer-clean, no crash on hostile input). See
+hardened core (24 CPU-hours of fuzzing and every hostile input tested,
+with no crash: see [Evidence](#evidence)). See
 [What ash still does better](#what-ash-still-does-better).
 
 ---
@@ -34,9 +35,11 @@ Invocation follows `ash`:
 
 Tested by `test_acsh.sh` sections [2.22] and [2.23].
 
-The build is a single binary of about 195 KB (stripped, `-O2`, glibc);
-`make MINIMAL=1` leaves out the line editor, completion and suggestions
-(about 180 KB) and reads plain lines, as `ash` without editing does.
+`make` gives a single binary of about 195 KB (stripped, `-O2`, glibc).
+The release build, `make static`, is built for size: about 130 KB of
+code (121 KB with `MINIMAL=1`, which leaves out the line editor,
+completion and suggestions and reads plain lines, as `ash` without
+editing does). Measured sizes are under [Evidence](#evidence).
 Nothing is installed and your login shell is not changed.
 
 `make static` builds `acsh-static`, a self-contained binary with no
@@ -52,15 +55,21 @@ musl as is; on a glibc system install musl-tools and run
 | Suite | What it checks |
 |---|---|
 | `tests/run_diff.sh` | Runs each of the 47 scripts in `tests/diff/` under acsh **and** under BusyBox `ash`, and requires identical stdout and exit status. |
-| `./acsh test_acsh.sh` | 117 checks, mostly of features that `ash` does not share (so they cannot be diffed), plus interactive behaviour through `-i`. |
-| `tests/pty/pty_test` | A C program that runs acsh on a pseudo-terminal and types keys: startup files (including `/etc/acshrc` and `su`, as root in CI), prompts, the line editor, completion and suggestions. |
-| Sanitizers and fuzzing | CI runs both suites under ASan/UBSan/LSan and fuzzes the parser and expansion with libFuzzer (`make fuzz`) for 2 minutes each on every push. |
-| CI | `.github/workflows/ci.yml`, on every push: both suites on Ubuntu; both suites on Alpine 3.20 (musl) against Alpine's own busybox `ash`, plus a login shell running Alpine's `/etc/profile`; and the static musl binary run in an empty `FROM scratch` container. |
+| `./acsh test_acsh.sh` | 130 checks, mostly of features that `ash` does not share (so they cannot be diffed), plus interactive behaviour through `-i`. |
+| `tests/pty/pty_test` | A C program that runs acsh on a pseudo-terminal and types keys: startup files (including `/etc/acshrc` and `su`, as root in CI), prompts, the line editor, completion and suggestions (46 checks). |
+| `tests/realworld/run.sh` | Real scripts under acsh and `ash`, compared: the system's `/etc/profile`, every init script in `/etc/init.d` (OpenRC's sourced, with `depend()` run), abuild and its `functions.sh`, and `./configure` of an autotools project generated on the spot. |
+| `tests/bash_extras/run.sh` | The bash extras (`<<<`, brace expansion, `printf %q`) against bash itself, table by table. |
+| `tests/crash/` | Known `ash` crash inputs (CVE-2022-48174's `${0::0/0~09J}`, and inputs aimed at the IFS-splitting and `evalcommand` heap overflows of busybox 1.38.0): each must run to the end. |
+| `tests/complaints.sh` | The community re-check: every complaint the roadmap set out to fix, with how many checks show it fixed, run on the release build (`make recheck`). |
+| `tests/bench/bench.sh` | Size, idle memory and 1,000 runs of `-c true` against a standalone static `ash` built from busybox source (CI, on Alpine), with the roadmap's size and speed gate. |
+| Sanitizers and fuzzing | CI runs the suites under ASan/UBSan/LSan and fuzzes the parser and expansion with libFuzzer (`make fuzz`) for 2 minutes each on every push. |
+| CI | `.github/workflows/ci.yml`, on every push: everything above on Ubuntu, on Alpine 3.20 (musl, against Alpine's own busybox `ash`, as root), on a `MINIMAL=1` build and under the sanitizers; the static musl binary run in an empty `FROM scratch` container. |
 
 Run them yourself:
 
 ```sh
-make check            # builds acsh and the pty tester, runs all three suites
+make check            # builds acsh and the pty tester, runs the suites
+make recheck          # the community re-check on the release build
 ```
 
 Everything needed is a C compiler, `make` and busybox (for the
@@ -68,9 +77,109 @@ comparison with `ash`); there is no Python or other runtime.
 
 ---
 
+## Evidence
+
+Measured on 2026-11-16 on an Intel Core Ultra 7 155H (22 threads,
+Linux, glibc), against Ubuntu's BusyBox 1.37.0 `ash`. CI repeats the
+size and speed comparison on Alpine against a standalone static `ash`
+built from BusyBox source (`bench` job).
+
+### Fuzzing: 24 CPU-hours, no crash
+
+Both libFuzzer targets (`make fuzz`, built with AddressSanitizer and
+UndefinedBehaviorSanitizer) ran for 72 minutes each with 10 parallel
+workers, 20 workers in all: 24 CPU-hours. They started from the test
+scripts and the known `ash` crash inputs in `tests/crash/`, and kept
+going after any finding (`-ignore_crashes=1` and the like) so that every
+problem would be recorded.
+
+| Target | What it exercises | Inputs run | Code edges reached | Crashes | Hangs | Out of memory |
+|---|---|---|---|---|---|---|
+| `fuzz_parse` | lexer and parser, whole scripts | 21.9 million | 1,879 | 0 | 0 | 0 |
+| `fuzz_expand` | every expansion and arithmetic | 147.5 million | 2,009 | 0 | 0 | 0 |
+
+Coverage stopped growing about 25 minutes before the end. To run the
+same campaign (a seed corpus can be any directory of shell scripts):
+
+```sh
+make fuzz
+mkdir -p corpus && cp tests/diff/*.sh tests/crash/*.sh corpus/
+./fuzz_parse  -fork=10 -max_total_time=4320 -timeout=10 -close_fd_mask=3 corpus/
+./fuzz_expand -fork=10 -max_total_time=4320 -timeout=10 -close_fd_mask=3 corpus/
+```
+
+Before this campaign, earlier shorter runs and the deep-input tests of
+phase 3 found and fixed: stack overflows on deeply nested input, a
+`SIGFPE` on `$(( LONG_MIN / -1 ))`, signed-overflow undefined behaviour
+in arithmetic, an exponent loop that never ended, quadratic slowdowns on
+long values and long lists, and a memory leak in the parser. Each has a
+test in `test_acsh.sh` [3.1] or `tests/crash/`. CI fuzzes both targets
+for 2 more minutes on every push.
+
+### Size, memory, startup
+
+`tests/bench/bench.sh`; memory is the shell's own idle RSS, read with
+builtins only; startup is 1,000 runs of `-c true` (best of three runs).
+
+| Build | Size (stripped) | Idle RSS | 1,000 × `-c true` |
+|---|---|---|---|
+| BusyBox `ash` 1.37.0 (static, all applets) | 2,190,672 B | 1,708 KB | 331 ms |
+| acsh, `make static` (static glibc) | 1,403,328 B | 1,388 KB | 314 ms |
+| acsh, `make static MINIMAL=1` (static glibc) | 1,391,040 B | 1,380 KB | 309 ms |
+| acsh code alone, release flags, dynamic | 133,352 B | | |
+| acsh code alone, `MINIMAL=1`, dynamic | 121,064 B | | |
+
+The static glibc sizes are mostly glibc itself; acsh's own code is the
+121–133 KB in the last two rows. On Alpine, statically linked with
+musl, the `bench` CI job compares acsh with an `ash`-only BusyBox and
+checks the roadmap's targets: the minimal build no bigger, heavier or
+slower than `ash`, the full build within 1.5× of its size.
+
+### The community complaints, re-checked
+
+`tests/complaints.sh` (`make recheck`) runs every suite on the release
+build and counts the checks behind each complaint the roadmap set out to
+fix. On the full release build, 260 checks passed and none failed; the
+5 skipped need root and run in the Alpine CI job.
+
+| Step | Complaint | Checks passed |
+|---|---|---|
+| 3.1 | long-string segfaults; `ash` CVEs in IFS splitting and recursion | 14 |
+| 3.2 | `~/.ashrc` ignored without `ENV`; aliases lost under `su`, `docker exec` | 5 (+2 as root in CI) |
+| 3.3 | history: Midnight Commander pollution, output on stderr, corrupted files | 10 |
+| 3.4 | an exported `PS1` breaks other shells | 5 |
+| 3.5 | bash scripts fail confusingly | 9 |
+| 3.6 | container scripts written for bash | 13 |
+| 3.7 | `ash` isn't a daily driver; no line editing | 23 |
+| 3.8 | completion covers only commands and files | 9 |
+| 3.9 | history suggestions | 4 |
+| 3.10 | `ash` is valued for being small | 1 (on the `MINIMAL=1` build, which passes 225 checks) |
+
+### The final code audit
+
+A whole-repo audit (correctness first, then safety, scale, tests, speed
+and size) found 10 issues; all are fixed, each with a test in
+`test_acsh.sh` [4.7] or `tests/bash_extras/`. A second pass found one
+more and a third found nothing. The ones that changed behaviour:
+
+| Found | Before | Now |
+|---|---|---|
+| `alias r='fc -s'`, `FCEDIT=... fc` | `fc` re-ran its own line until the depth limit | runs the previous command once |
+| 65 functions, 33 aliases, a 256-character alias | "table full"; long values cut short silently | no limit |
+| 33 background jobs, then `wait $!` | 127 ("unknown") | the job's status |
+| `{1,2,...,300}` | 257 words, the last glued together | 300 words, as bash |
+| a 300-character variable name | `$name` read the wrong variable; arithmetic failed | works, as in `ash` |
+
+The lean findings removed about 27 lines (three copies of the quoting
+code merged into one, a duplicate name check, dead code). Later passes
+of the sanitizers and the fuzzers over the fixed code were clean.
+
+---
+
 ## What acsh implements (same as ash)
 
-Every item in this table is covered by a differential test, so it behaves as `ash` does.
+Every item is covered by the tests named beside it: the `tests/diff/` scripts compare acsh's output
+with `ash`'s, and the test_acsh sections check what a diff cannot (startup files, job control).
 
 | Area | Details | Tests (`tests/diff/`) |
 |---|---|---|
@@ -137,13 +246,12 @@ These are known gaps:
 
 - **vi editing mode.** acsh's line editor has emacs keys only;
   `set -o vi` is accepted but does nothing.
-- **Speed.** BusyBox runs many applets (for example `ls` and `cat`)
-  inside the shell process without forking; acsh always runs external
-  programs. On a pure arithmetic loop (`while [ $i -lt 100000 ]`) acsh
-  takes about 1.6× as long as `ash` (0.25 s against 0.16 s on the test
-  machine).
-- **Memory.** Peak RSS for a small script is about 1.8 MB, against 1.6 MB
-  for `ash`.
+- **Speed of long scripts.** BusyBox runs many applets (for example
+  `ls` and `cat`) inside the shell process without forking; acsh always
+  runs external programs. On a pure arithmetic loop
+  (`while [ $i -lt 100000 ]`) acsh takes about 1.6× as long as `ash`
+  (0.13 s against 0.08 s). Starting up is not slower: see
+  [Evidence](#evidence).
 - **`set -m`** cannot be toggled; job control is on exactly when the
   shell is interactive. `set -b` is accepted, but job changes are still
   reported at the next prompt.
@@ -213,7 +321,7 @@ make static                                 # acsh-static (use CC=musl-gcc on gl
 make MINIMAL=1                              # without the line editor, completion, suggestions
 ./acsh test_acsh.sh                         # acsh's own suite
 tests/run_diff.sh                           # needs busybox
-make check                                  # all three suites (with MINIMAL=1 too)
+make check                                  # all suites (with MINIMAL=1 too)
 make fuzz && ./fuzz_parse -max_total_time=60 tests/diff   # libFuzzer (clang)
 gcc -std=c11 -Iinclude -g -fsanitize=address,undefined -o /tmp/acsh-asan src/*.c
 tests/run_diff.sh /tmp/acsh-asan            # same tests under the sanitizers

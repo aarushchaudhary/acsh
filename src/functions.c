@@ -10,18 +10,18 @@
  * runs keeps running its old body until it returns. */
 
 typedef struct {
-    char  name[64];
+    char *name;
     Node *body;
-    int   in_use;
 } ShellFunction;
 
-static ShellFunction function_table[ACSH_MAX_FUNCTIONS];
+/* The table grows as needed. function_call() takes its own reference
+ * to the body first, so the table may move while a function runs. */
+static ShellFunction *functions = NULL;
+static int            nfunctions = 0, cap = 0;
 
 static ShellFunction *find_function(const char *name) {
-    for (int i = 0; i < ACSH_MAX_FUNCTIONS; i++) {
-        if (function_table[i].in_use && strcmp(function_table[i].name, name) == 0) {
-            return &function_table[i];
-        }
+    for (int i = 0; i < nfunctions; i++) {
+        if (strcmp(functions[i].name, name) == 0) return &functions[i];
     }
     return NULL;
 }
@@ -31,35 +31,40 @@ int function_is_defined(const char *name) {
 }
 
 void function_define(const char *name, Node *body) {
-    ShellFunction *slot = find_function(name);
-    for (int i = 0; slot == NULL && i < ACSH_MAX_FUNCTIONS; i++) {
-        if (!function_table[i].in_use) {
-            slot = &function_table[i];
+    ShellFunction *fn = find_function(name);
+    if (fn != NULL) {
+        node_unref(fn->body);
+        fn->body = body;
+        return;
+    }
+    if (nfunctions == cap) {
+        int ncap = cap ? cap * 2 : 32;
+        ShellFunction *bigger = realloc(functions, (size_t)ncap * sizeof(ShellFunction));
+        if (bigger == NULL) {
+            shell_error("out of memory, cannot define '%s'\n", name);
+            node_unref(body);
+            return;
         }
+        functions = bigger;
+        cap = ncap;
     }
-    if (slot == NULL) {
-        shell_error("function table full, cannot define '%s'\n", name);
+    functions[nfunctions].name = strdup(name);
+    if (functions[nfunctions].name == NULL) {
+        shell_error("out of memory, cannot define '%s'\n", name);
         node_unref(body);
         return;
     }
-    if (strlen(name) >= sizeof(slot->name)) {
-        shell_error("function name too long: %s\n", name);
-        node_unref(body);
-        return;
-    }
-    node_unref(slot->in_use ? slot->body : NULL);
-    strcpy(slot->name, name);
-    slot->body = body;
-    slot->in_use = 1;
+    functions[nfunctions++].body = body;
 }
 
 void function_undefine(const char *name) {
     ShellFunction *fn = find_function(name);
-    if (fn != NULL) {
-        node_unref(fn->body);
-        fn->body = NULL;
-        fn->in_use = 0;
-    }
+    if (fn == NULL) return;
+    int i = (int)(fn - functions);
+    node_unref(fn->body);
+    free(fn->name);
+    memmove(functions + i, functions + i + 1, (size_t)(nfunctions - i - 1) * sizeof(ShellFunction));
+    nfunctions--;
 }
 
 int function_call(int argc, char *argv[]) {
@@ -93,7 +98,5 @@ int function_call(int argc, char *argv[]) {
 
 /* Every function name, for Tab completion. */
 void function_each(void (*fn)(const char *name, void *ctx), void *ctx) {
-    for (int i = 0; i < ACSH_MAX_FUNCTIONS; i++) {
-        if (function_table[i].in_use) fn(function_table[i].name, ctx);
-    }
+    for (int i = 0; i < nfunctions; i++) fn(functions[i].name, ctx);
 }

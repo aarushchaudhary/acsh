@@ -94,13 +94,33 @@ static void trap_handler(int sig) {
  * asynchronous command, SIGINT and SIGQUIT): POSIX says they stay
  * ignored -- trap cannot catch or reset them, and children inherit it. */
 static unsigned char locked_ignored[NSIG];
+static unsigned char entry_checked[NSIG];
+static int noninteractive_at_start = 0;
+
+/* Whether sig was ignored when a non-interactive shell started. Asked
+ * the first time it matters, which is always before the shell itself
+ * changes sig (at startup for INT and TSTP, in trap for the rest), so
+ * a script does not pay a sigaction() for every signal at startup.
+ * Subshells of an interactive shell never lock: what they inherit was
+ * set by that shell's job control, not by whoever started it. */
+static void check_entry(int sig) {
+    if (sig <= 0 || sig >= NSIG || entry_checked[sig]) return;
+    entry_checked[sig] = 1;
+    struct sigaction old;
+    if (noninteractive_at_start && sig != SIGKILL && sig != SIGSTOP && sig != SIGCHLD &&
+        sigaction(sig, NULL, &old) == 0 && old.sa_handler == SIG_IGN) {
+        locked_ignored[sig] = 1;
+    }
+}
 
 void signal_lock_ignored(int sig) {
+    entry_checked[sig] = 1;
     locked_ignored[sig] = 1;
     signal(sig, SIG_IGN);
 }
 
 void signal_default(int sig) {
+    check_entry(sig);
     signal(sig, locked_ignored[sig] ? SIG_IGN : SIG_DFL);
 }
 
@@ -138,6 +158,7 @@ int trap_set(const char *spec, const char *action) {
     if (sig <= 0) {
         return -1;
     }
+    check_entry(sig);
     if (locked_ignored[sig]) {
         return 0; /* ignored on entry: silently stays ignored (POSIX) */
     }
@@ -238,12 +259,9 @@ void trap_reset_for_subshell(void) {
 }
 
 static void print_trap(const char *cmd, const char *name) {
-    fputs("trap -- '", stdout);
-    for (const char *c = cmd; *c; c++) {
-        if (*c == '\'') fputs("'\"'\"'", stdout);
-        else putchar(*c);
-    }
-    printf("' %s\n", name);
+    fputs("trap -- ", stdout);
+    print_single_quoted(cmd);
+    printf(" %s\n", name);
 }
 
 void trap_print(void) {
@@ -368,15 +386,9 @@ static void install_shell_handler(int sig) {
 }
 
 void signals_init(void) {
-    if (!shell_is_interactive()) {
-        for (int sig = 1; sig < NSIG; sig++) {
-            struct sigaction old;
-            if (sig != SIGKILL && sig != SIGSTOP && sig != SIGCHLD &&
-                sigaction(sig, NULL, &old) == 0 && old.sa_handler == SIG_IGN) {
-                locked_ignored[sig] = 1;
-            }
-        }
-    }
+    noninteractive_at_start = !shell_is_interactive();
+    check_entry(SIGINT);   /* the two the shell changes right away */
+    check_entry(SIGTSTP);
     struct sigaction sa_chld;
     sa_chld.sa_handler = sigchld_handler;
     sigemptyset(&sa_chld.sa_mask);

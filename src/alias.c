@@ -4,7 +4,22 @@
 #include <string.h>
 #include "acsh.h"
 
-static Alias alias_table[ACSH_MAX_ALIASES];
+/* Aliases, in the order they were defined (as `alias` lists them).
+ * The table grows as needed and values may be any length. */
+typedef struct {
+    char *name;
+    char *value;
+} Alias;
+
+static Alias *aliases = NULL;
+static int    naliases = 0, cap = 0;
+
+static int find(const char *name) {
+    for (int i = 0; i < naliases; i++) {
+        if (strcmp(aliases[i].name, name) == 0) return i;
+    }
+    return -1;
+}
 
 /* These are exactly the defaults the sourced community complaints
  * named as missing from ash (e.g. no `ll`), plus a couple of standard
@@ -19,67 +34,65 @@ void alias_load_defaults(void) {
 }
 
 void alias_set(const char *name, const char *value) {
-    /* if it already exists, update in place */
-    for (int i = 0; i < ACSH_MAX_ALIASES; i++) {
-        if (alias_table[i].in_use && strcmp(alias_table[i].name, name) == 0) {
-            strncpy(alias_table[i].value, value, sizeof(alias_table[i].value) - 1);
-            alias_table[i].value[sizeof(alias_table[i].value) - 1] = '\0';
+    char *copy = strdup(value);
+    if (copy == NULL) {
+        shell_error("out of memory\n");
+        return;
+    }
+    int i = find(name);
+    if (i >= 0) {
+        free(aliases[i].value);
+        aliases[i].value = copy;
+        return;
+    }
+    if (naliases == cap) {
+        int ncap = cap ? cap * 2 : 16;
+        Alias *bigger = realloc(aliases, (size_t)ncap * sizeof(Alias));
+        if (bigger == NULL) {
+            free(copy);
+            shell_error("out of memory\n");
             return;
         }
+        aliases = bigger;
+        cap = ncap;
     }
-    /* otherwise find a free slot */
-    for (int i = 0; i < ACSH_MAX_ALIASES; i++) {
-        if (!alias_table[i].in_use) {
-            alias_table[i].in_use = 1;
-            strncpy(alias_table[i].name, name, sizeof(alias_table[i].name) - 1);
-            alias_table[i].name[sizeof(alias_table[i].name) - 1] = '\0';
-            strncpy(alias_table[i].value, value, sizeof(alias_table[i].value) - 1);
-            alias_table[i].value[sizeof(alias_table[i].value) - 1] = '\0';
-            return;
-        }
+    aliases[naliases].name = strdup(name);
+    aliases[naliases].value = copy;
+    if (aliases[naliases].name == NULL) {
+        free(copy);
+        shell_error("out of memory\n");
+        return;
     }
-    shell_error("alias table full\n");
+    naliases++;
 }
 
 void alias_unset(const char *name) {
-    for (int i = 0; i < ACSH_MAX_ALIASES; i++) {
-        if (alias_table[i].in_use && strcmp(alias_table[i].name, name) == 0) {
-            alias_table[i].in_use = 0;
-            return;
-        }
-    }
+    int i = find(name);
+    if (i < 0) return;
+    free(aliases[i].name);
+    free(aliases[i].value);
+    memmove(aliases + i, aliases + i + 1, (size_t)(naliases - i - 1) * sizeof(Alias));
+    naliases--;
 }
 
 const char *alias_get(const char *name) {
-    for (int i = 0; i < ACSH_MAX_ALIASES; i++) {
-        if (alias_table[i].in_use && strcmp(alias_table[i].name, name) == 0) {
-            return alias_table[i].value;
-        }
-    }
-    return NULL;
+    int i = find(name);
+    return i >= 0 ? aliases[i].value : NULL;
 }
 
-/* name='value' in ash's form, a ' inside written as '"'"' */
+/* name='value' in ash's form */
 void alias_print(const char *name, const char *value) {
-    printf("%s='", name);
-    for (const char *c = value; *c; c++) {
-        if (*c == '\'') fputs("'\"'\"'", stdout);
-        else putchar(*c);
-    }
-    puts("'");
+    fputs(name, stdout);
+    putchar('=');
+    print_single_quoted(value);
+    putchar('\n');
 }
 
 void alias_print_all(void) {
-    for (int i = 0; i < ACSH_MAX_ALIASES; i++) {
-        if (alias_table[i].in_use) {
-            alias_print(alias_table[i].name, alias_table[i].value);
-        }
-    }
+    for (int i = 0; i < naliases; i++) alias_print(aliases[i].name, aliases[i].value);
 }
 
 /* Every alias name, for Tab completion. */
 void alias_each(void (*fn)(const char *name, void *ctx), void *ctx) {
-    for (int i = 0; i < ACSH_MAX_ALIASES; i++) {
-        if (alias_table[i].in_use) fn(alias_table[i].name, ctx);
-    }
+    for (int i = 0; i < naliases; i++) fn(aliases[i].name, ctx);
 }

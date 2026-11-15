@@ -137,7 +137,7 @@ typedef enum {
 ParseResult parse_next(Lexer *lx, Node **out);
 
 /* Drops whatever input is buffered (e.g. after Ctrl+C at the prompt). */
-void lex_discard_input(Lexer *lx);
+void lex_discard(Lexer *lx);
 
 /* ---- executor (exec.c) and functions (functions.c) ---- */
 

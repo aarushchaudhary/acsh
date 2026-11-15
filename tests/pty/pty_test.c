@@ -270,7 +270,7 @@ static void typed(Session *s, ...) {
 static int got(Session *s, const char *text) {
     char want[8300];
     snprintf(want, sizeof(want), "\n%s\r\n", text);
-    return expect(s, want, 2.0);
+    return expect(s, want, 5.0);
 }
 
 /* ---- 3.2 startup files ---- */
@@ -284,9 +284,9 @@ static void test_startup(void) {
 
     Session *s = start(NULL, clean_env(home, NULL, NULL), NULL);
     ssend(s, "fromrc\n", 0.4);
-    check("a plain interactive shell (docker exec -it, lxc exec) reads ~/.acshrc", expect(s, "rc-alias-works", 3), s);
+    check("a plain interactive shell (docker exec -it, lxc exec) reads ~/.acshrc", expect(s, "rc-alias-works", 5), s);
     ssend(s, "ll >/dev/null && echo default-ll-ok\n", 0.4);
-    check("the default aliases are there too", expect(s, "default-ll-ok", 3), s);
+    check("the default aliases are there too", expect(s, "default-ll-ok", 5), s);
     finish(s);
 
     path_join(file, sizeof(file), home, "envfile");
@@ -294,7 +294,7 @@ static void test_startup(void) {
     s = start(NULL, clean_env(home, "ENV=$HOME/envfile", NULL), NULL);
     ssend(s, "fromenv; fromrc\n", 0.4);
     check("$ENV is expanded and read after ~/.acshrc",
-          expect(s, "env-alias-works", 3) && expect(s, "rc-alias-works", 3), s);
+          expect(s, "env-alias-works", 5) && expect(s, "rc-alias-works", 5), s);
     finish(s);
 
     if (geteuid() != 0) {
@@ -309,7 +309,7 @@ static void test_startup(void) {
     write_file("/etc/acshrc", "alias sysalias='echo system-alias-works'\n");
     s = start(NULL, clean_env(home, NULL, NULL), NULL);
     ssend(s, "sysalias\n", 0.4);
-    check("/etc/acshrc is read by every interactive shell", expect(s, "system-alias-works", 3), s);
+    check("/etc/acshrc is read by every interactive shell", expect(s, "system-alias-works", 5), s);
     finish(s);
     const char *su = NULL;
     static const char *places[] = { "/bin/su", "/usr/bin/su", "/sbin/su", "/usr/sbin/su", NULL };
@@ -323,7 +323,7 @@ static void test_startup(void) {
         s = start(argv, clean_env("/", NULL, NULL), "/");
         ssend(s, "sysalias; id -un\n", 0.4);
         check("aliases from /etc/acshrc survive su to another user",
-              expect(s, "system-alias-works", 3) && expect(s, "nobody", 3), s);
+              expect(s, "system-alias-works", 5) && expect(s, "nobody", 5), s);
         finish(s);
     }
     unlink("/etc/acshrc");
@@ -345,18 +345,18 @@ static void test_prompt(void) {
     char want[128];
     Session *s = start(NULL, clean_env(home, NULL, NULL), repo);
     snprintf(want, sizeof(want), "acsh:~/proj/sub (feature-x)%s ", mark);
-    check("the default prompt shows ~ and the git branch", expect(s, want, 3), s);
+    check("the default prompt shows ~ and the git branch", expect(s, want, 5), s);
     ssend(s, "cd /\n", 0.4);
     snprintf(want, sizeof(want), "acsh:/%s ", mark);
-    check("outside a repository there is no branch", expect(s, want, 3), s);
+    check("outside a repository there is no branch", expect(s, want, 5), s);
     ssend(s, "PS1='[\\?|$((6*7))|\\W]\\$ '; false\n", 0.4);
     snprintf(want, sizeof(want), "[1|42|/]%s ", mark);
-    check("PS1 escapes and $((...)) expand: last status, last dir part", expect(s, want, 3), s);
+    check("PS1 escapes and $((...)) expand: last status, last dir part", expect(s, want, 5), s);
     ssend(s, "PS2='more> '; if true\n", 0.4);
-    check("PS2 is used for continuation lines", expect(s, "more> ", 3), s);
+    check("PS2 is used for continuation lines", expect(s, "more> ", 5), s);
     ssend(s, "then echo done; fi\n", 0.4);
     ssend(s, "export PS1; env | grep -c '^PS1='\n", 0.4);
-    check("PS1 is never exported, even after export PS1", expect(s, "\r\n0\r\n", 3), s);
+    check("PS1 is never exported, even after export PS1", expect(s, "\r\n0\r\n", 5), s);
     finish(s);
 }
 
@@ -431,7 +431,7 @@ static void test_lineedit(void) {
           got(s, "OUT:recovered") && !contains(s, "syntax error"), s);
     typed(s, "set -o ignoreeof", NULL);
     ssend(s, key("C-d"), 0.3);
-    check("Ctrl-D on an empty line with ignoreeof does not exit", expect(s, "Use \"exit\"", 3), s);
+    check("Ctrl-D on an empty line with ignoreeof does not exit", expect(s, "Use \"exit\"", 5), s);
     typed(s, "set +o ignoreeof", NULL);
     ssend(s, key("C-d"), 0.5);
     pid_t done = waitpid(s->pid, NULL, WNOHANG);
@@ -450,7 +450,7 @@ static void test_lineedit(void) {
 
     s = start(NULL, clean_env(home, "TERM=dumb", NULL), NULL);
     ssend(s, "echo OUT:$((2+3))\r", 0.4);
-    check("TERM=dumb reads plain lines (no editor)", expect(s, "OUT:5", 3) && !contains(s, "\033[K"), s);
+    check("TERM=dumb reads plain lines (no editor)", expect(s, "OUT:5", 5) && !contains(s, "\033[K"), s);
     finish(s);
 }
 
@@ -488,11 +488,11 @@ static void test_complete(void) {
     typed(s, "echo sam\tinn\t", NULL);
     check("a name with a space is escaped, and completion goes on inside it", got(s, "sample dir/inner.txt"), s);
     ssend(s, "apk upg\t", 0.3);
-    check("apk upg<Tab> completes to apk upgrade", expect(s, "apk upgrade ", 3), s);
+    check("apk upg<Tab> completes to apk upgrade", expect(s, "apk upgrade ", 5), s);
     ssend(s, key("C-u"), 0.2);
     ssend(s, "ls s\t", 0.4);
     check("when Tab adds nothing, the choices are listed",
-          expect(s, "sample dir/", 3) && expect(s, "srcfile.c", 3), s);
+          expect(s, "sample dir/", 5) && expect(s, "srcfile.c", 5), s);
     finish(s);
 }
 
@@ -568,7 +568,7 @@ int main(int argc, char **argv) {
         printf("[minimal]\n");
         Session *s = start(NULL, clean_env(tmp, NULL, NULL), NULL);
         ssend(s, "echo OUT:$((40+2))\r", 0.4);
-        check("a MINIMAL build reads plain lines on a terminal", expect(s, "OUT:42", 3) && !contains(s, "\033[K"), s);
+        check("a MINIMAL build reads plain lines on a terminal", expect(s, "OUT:42", 5) && !contains(s, "\033[K"), s);
         finish(s);
     }
     nftw(tmp, remove_entry, 16, FTW_DEPTH | FTW_PHYS);

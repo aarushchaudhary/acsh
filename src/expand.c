@@ -209,15 +209,23 @@ static void set_var(Arith *ar, const char *name, long v) {
     if (var_set(name, buf) != 0) failed = 1;
 }
 
-static int read_name(Arith *ar, char *name, size_t size) {
+/* A variable name at the cursor, or NULL. It is copied into buf when it
+ * fits (the usual case, no allocation); a longer one goes on the heap,
+ * and the caller frees the result when it is not buf (name_done). */
+static char *read_name(Arith *ar, char *buf, size_t size) {
     ws(ar);
-    size_t k = 0;
-    if (!(isalpha((unsigned char)ar->s[ar->p]) || ar->s[ar->p] == '_')) return 0;
-    while ((isalnum((unsigned char)ar->s[ar->p]) || ar->s[ar->p] == '_') && k + 1 < size) {
-        name[k++] = ar->s[ar->p++];
-    }
-    name[k] = '\0';
-    return 1;
+    if (!(isalpha((unsigned char)ar->s[ar->p]) || ar->s[ar->p] == '_')) return NULL;
+    size_t start = ar->p;
+    while (isalnum((unsigned char)ar->s[ar->p]) || ar->s[ar->p] == '_') ar->p++;
+    size_t len = ar->p - start;
+    char *name = len < size ? buf : malloc(len + 1);
+    memcpy(name, ar->s + start, len);
+    name[len] = '\0';
+    return name;
+}
+
+static void name_done(char *name, const char *buf) {
+    if (name != buf) free(name);
 }
 
 static long arith_primary(Arith *ar) {
@@ -258,11 +266,13 @@ static long arith_primary(Arith *ar) {
         if (isalnum((unsigned char)ar->s[ar->p])) arith_fail(ar, "arithmetic syntax error");
         return v;
     }
-    char name[256];
-    if (read_name(ar, name, sizeof(name))) {
+    char buf[256];
+    char *name = read_name(ar, buf, sizeof(buf));
+    if (name != NULL) {
         long v = var_value(ar, name);
-        if (take_op(ar, "++")) { set_var(ar, name, w_add(v, 1)); return v; }
-        if (take_op(ar, "--")) { set_var(ar, name, w_sub(v, 1)); return v; }
+        if (take_op(ar, "++")) set_var(ar, name, w_add(v, 1));
+        else if (take_op(ar, "--")) set_var(ar, name, w_sub(v, 1));
+        name_done(name, buf);
         return v;
     }
     arith_fail(ar, "arithmetic syntax error");
@@ -274,14 +284,16 @@ static long arith_unary(Arith *ar) {
         arith_fail(ar, "arithmetic expression nested too deeply");
         return 0;
     }
-    char name[256];
+    char buf[256];
     int inc = take_op(ar, "++");
     int dec = !inc && take_op(ar, "--");
     if (inc || dec) {
         size_t save = ar->p;
-        if (read_name(ar, name, sizeof(name))) {
+        char *name = read_name(ar, buf, sizeof(buf));
+        if (name != NULL) {
             long v = w_add(var_value(ar, name), inc ? 1 : -1);
             set_var(ar, name, v);
+            name_done(name, buf);
             return v;
         }
         ar->p = save;
@@ -439,8 +451,9 @@ static long arith_assign(Arith *ar) {
         return 0;
     }
     size_t save = ar->p;
-    char name[256];
-    if (read_name(ar, name, sizeof(name))) {
+    char buf[256];
+    char *name = read_name(ar, buf, sizeof(buf));
+    if (name != NULL) {
         static const char *ops[] = { "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=", "=" };
         for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
             if (at(ar, ops[i]) && !(ops[i][0] == '=' && ar->s[ar->p + 1] == '=')) {
@@ -453,7 +466,7 @@ static long arith_assign(Arith *ar) {
                 case '-': v = w_sub(v, r); break;
                 case '*': v = w_mul(v, r); break;
                 case '/': case '%':
-                    if (r == 0) { arith_fail(ar, "divide by zero"); return 0; }
+                    if (r == 0) { arith_fail(ar, "divide by zero"); name_done(name, buf); return 0; }
                     v = (ops[i][0] == '/') ? w_div(v, r) : w_mod(v, r);
                     break;
                 case '<': v = w_shl(v, r); break;
@@ -463,9 +476,11 @@ static long arith_assign(Arith *ar) {
                 case '|': v |= r; break;
                 }
                 set_var(ar, name, v);
+                name_done(name, buf);
                 return v;
             }
         }
+        name_done(name, buf);
         ar->p = save;
     }
     return arith_ternary(ar);
@@ -992,19 +1007,18 @@ static size_t expand_dollar(Buf *b, const char *w, size_t i, int dq, int *empty_
         free(inner);
         return w[close] ? close + 1 : close;
     }
-    char name[256];
     size_t n = 0;
     if (isdigit((unsigned char)next) || (next && strchr("@*#?-$!", next))) {
-        name[n++] = next;
+        n = 1;
     } else if (is_name_start(next)) {
-        while (is_name_char(w[i + 1 + n]) && n + 1 < sizeof(name)) {
-            name[n] = w[i + 1 + n];
-            n++;
-        }
+        while (is_name_char(w[i + 1 + n])) n++;
     } else {
         bput(b, '$', dq ? A_QUO : A_LIT); /* a lone $ */
         return i + 1;
     }
+    char buf[256];
+    char *name = n < sizeof(buf) ? buf : malloc(n + 1);   /* any length */
+    memcpy(name, w + i + 1, n);
     name[n] = '\0';
     if (strcmp(name, "@") == 0 || strcmp(name, "*") == 0) {
         put_params(b, name[0] == '*', dq, empty_at);
@@ -1014,6 +1028,7 @@ static size_t expand_dollar(Buf *b, const char *w, size_t i, int dq, int *empty_
         if (v) bputs(b, v, attr);
         free(v);
     }
+    if (name != buf) free(name);
     return i + 1 + n;
 }
 
@@ -1340,10 +1355,10 @@ static int brace_expand_into(const char *w, WordList *out, int depth) {
         if (after != i) { i = after; continue; }
         if (w[i] == '\\' && w[i + 1]) { i += 2; continue; }
         if (w[i] != '{') { i++; continue; }
-        /* the matching }, and the commas at this level */
-        size_t commas[256];
+        /* the matching }, cutting the items at the commas of this level */
+        WordList items = { 0 };
         int ncommas = 0, level = 0;
-        size_t j = i + 1, close = 0;
+        size_t j = i + 1, close = 0, start = i + 1;
         while (w[j]) {
             size_t a2 = skip_region(w, j);
             if (a2 != j) { j = a2; continue; }
@@ -1352,20 +1367,21 @@ static int brace_expand_into(const char *w, WordList *out, int depth) {
             else if (w[j] == '}') {
                 if (level == 0) { close = j; break; }
                 level--;
-            } else if (w[j] == ',' && level == 0 && ncommas < 256) {
-                commas[ncommas++] = j;
+            } else if (w[j] == ',' && level == 0) {
+                wl_push(&items, strndup(w + start, j - start));
+                start = j + 1;
+                ncommas++;
             }
             j++;
         }
-        if (close == 0) return wl_push(out, strdup(w)), 0;   /* no closing brace: nothing to do */
-        WordList items = { 0 };
+        if (close == 0) {                      /* no closing brace: nothing to do */
+            for (int k = 0; k < items.n; k++) free(items.w[k]);
+            free(items.w);
+            wl_push(out, strdup(w));
+            return 0;
+        }
         if (ncommas > 0) {
-            size_t start = i + 1;
-            for (int k = 0; k <= ncommas; k++) {
-                size_t end = (k < ncommas) ? commas[k] : close;
-                wl_push(&items, strndup(w + start, end - start));
-                start = end + 1;
-            }
+            wl_push(&items, strndup(w + start, close - start));
         } else {
             int r = brace_sequence(w + i + 1, close - i - 1, &items);
             if (r < 0) { free(items.w); return -1; }

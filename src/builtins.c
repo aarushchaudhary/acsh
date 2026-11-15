@@ -401,15 +401,10 @@ static int builtin_alias(Command *cmd) {
             }
             continue;
         }
-        size_t name_len = (size_t)(eq - arg);
-        char name[64];
-        if (name_len >= sizeof(name)) {
-            shell_error("alias: name too long\n");
-            continue;
-        }
-        memcpy(name, arg, name_len);
-        name[name_len] = '\0';
+        char *name = strndup(arg, (size_t)(eq - arg));
+        if (name == NULL) continue;
         alias_set(name, eq + 1);
+        free(name);
     }
     return 0;
 }
@@ -838,19 +833,13 @@ static int builtin_local(Command *cmd) {
         char *eq = strchr(arg, '=');
 
         if (eq != NULL) {
-            size_t name_len = (size_t)(eq - arg);
-            char name[256];
-            if (name_len >= sizeof(name)) {
-                shell_error("local: variable name too long\n");
-                status = 1;
-                continue;
-            }
-            memcpy(name, arg, name_len);
-            name[name_len] = '\0';
+            char *name = strndup(arg, (size_t)(eq - arg));
+            if (name == NULL) continue;
             if (env_declare_local(name, eq + 1) != 0) {
                 shell_error("local: %s: not inside a function\n", name);
                 status = 1;
             }
+            free(name);
         } else {
             if (env_declare_local(arg, NULL) != 0) {
                 shell_error("local: %s: not inside a function\n", arg);
@@ -1205,7 +1194,7 @@ static int wait_for_job(Job *j) {
 /* wait [PID | %JOB ...]: no operand waits for every background job. */
 static int builtin_wait(Command *cmd) {
     if (cmd->argc < 2) {
-        for (int i = 0; i < ACSH_MAX_JOBS; i++) {
+        for (int i = 0; i < jobs_capacity(); i++) {
             Job *j = jobs_at(i);
             if (j != NULL && j->state != JOB_STOPPED) {
                 int st = wait_for_job(j);
@@ -1389,8 +1378,8 @@ static int builtin_ulimit(Command *cmd) {
 
 /* hash [-r] [NAME...]: remembers where commands are found in $PATH and
  * lists them; -r forgets them. */
-static char *hashed[64];
-static int nhashed = 0;
+static char **hashed = NULL;
+static int nhashed = 0, hashed_cap = 0;
 
 static int builtin_hash(Command *cmd) {
     if (cmd->argc == 1) {
@@ -1413,7 +1402,12 @@ static int builtin_hash(Command *cmd) {
         }
         int known = 0;
         for (int k = 0; k < nhashed; k++) if (strcmp(hashed[k], path) == 0) known = 1;
-        if (!known && nhashed < 64) hashed[nhashed++] = path;
+        if (!known && nhashed == hashed_cap) {
+            int ncap = hashed_cap ? hashed_cap * 2 : 32;
+            char **bigger = realloc(hashed, (size_t)ncap * sizeof(char *));
+            if (bigger != NULL) { hashed = bigger; hashed_cap = ncap; }
+        }
+        if (!known && nhashed < hashed_cap) hashed[nhashed++] = path;
         else free(path);
     }
     return status;
