@@ -340,12 +340,18 @@ static void test_prompt(void) {
     make_dirs(repo);
     path_join(head, sizeof(head), git, "HEAD");
     write_file(head, "ref: refs/heads/feature-x\n");
+    /* \$ is # for root (as in the Alpine CI container), $ for anyone else */
+    const char *mark = geteuid() == 0 ? "#" : "$";
+    char want[128];
     Session *s = start(NULL, clean_env(home, NULL, NULL), repo);
-    check("the default prompt shows ~ and the git branch", expect(s, "acsh:~/proj/sub (feature-x)$ ", 3), s);
+    snprintf(want, sizeof(want), "acsh:~/proj/sub (feature-x)%s ", mark);
+    check("the default prompt shows ~ and the git branch", expect(s, want, 3), s);
     ssend(s, "cd /\n", 0.4);
-    check("outside a repository there is no branch", expect(s, "acsh:/$ ", 3), s);
+    snprintf(want, sizeof(want), "acsh:/%s ", mark);
+    check("outside a repository there is no branch", expect(s, want, 3), s);
     ssend(s, "PS1='[\\?|$((6*7))|\\W]\\$ '; false\n", 0.4);
-    check("PS1 escapes and $((...)) expand: last status, last dir part", expect(s, "[1|42|/]$ ", 3), s);
+    snprintf(want, sizeof(want), "[1|42|/]%s ", mark);
+    check("PS1 escapes and $((...)) expand: last status, last dir part", expect(s, want, 3), s);
     ssend(s, "PS2='more> '; if true\n", 0.4);
     check("PS2 is used for continuation lines", expect(s, "more> ", 3), s);
     ssend(s, "then echo done; fi\n", 0.4);
