@@ -38,12 +38,12 @@ void function_define(const char *name, Node *body) {
         }
     }
     if (slot == NULL) {
-        fprintf(stderr, "acsh: function table full, cannot define '%s'\n", name);
+        shell_error("function table full, cannot define '%s'\n", name);
         node_unref(body);
         return;
     }
     if (strlen(name) >= sizeof(slot->name)) {
-        fprintf(stderr, "acsh: function name too long: %s\n", name);
+        shell_error("function name too long: %s\n", name);
         node_unref(body);
         return;
     }
@@ -65,12 +65,12 @@ void function_undefine(const char *name) {
 int function_call(int argc, char *argv[]) {
     ShellFunction *fn = find_function(argv[0]);
     if (fn == NULL) {
-        fprintf(stderr, "acsh: %s: function not found\n", argv[0]);
+        shell_error("%s: function not found\n", argv[0]);
         return 127;
     }
     /* refuse runaway recursion before it exhausts the C stack */
     if (env_get_call_depth() >= ACSH_MAX_CALL_DEPTH) {
-        fprintf(stderr, "acsh: %s: maximum function nesting depth (%d) exceeded\n",
+        shell_error("%s: maximum function nesting depth (%d) exceeded\n",
                 argv[0], ACSH_MAX_CALL_DEPTH);
         return 1;
     }

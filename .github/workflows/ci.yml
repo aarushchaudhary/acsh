@@ -6,6 +6,7 @@ on:
 
 jobs:
   test:
+    name: Ubuntu (glibc)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,3 +26,57 @@ jobs:
 
       - name: Differential tests against busybox ash
         run: tests/run_diff.sh ./acsh
+
+  alpine:
+    name: Alpine (musl, real busybox ash)
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: apk add --no-cache build-base busybox
+
+      - name: Build (dynamic and static)
+        run: |
+          make
+          make static
+          ls -l acsh acsh-static
+
+      - name: Test suite (run by acsh itself)
+        run: |
+          sed -i 's/\r$//' test_acsh.sh
+          ./acsh test_acsh.sh
+
+      - name: Differential tests against Alpine's busybox ash
+        run: tests/run_diff.sh ./acsh
+
+      - name: Alpine's /etc/profile runs cleanly in a login shell
+        run: |
+          ./acsh -l -c 'echo "login PATH=$PATH"' 2>profile.err
+          cat profile.err
+          test ! -s profile.err
+
+      - name: Keep the static binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: acsh-static
+          path: acsh-static
+
+  scratch:
+    name: Static binary in an empty container
+    needs: alpine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: acsh-static
+
+      - name: Run acsh-static in FROM scratch (no libc, no files)
+        run: |
+          chmod +x acsh-static
+          printf 'FROM scratch\nCOPY acsh-static /acsh\nENTRYPOINT ["/acsh"]\n' > Dockerfile
+          docker build -t acsh-scratch .
+          out=$(docker run --rm acsh-scratch -c 'x=$((6*7)); f() { echo "f:$1"; }; f "$x"; case $x in 4?) echo match;; esac')
+          echo "$out"
+          test "$out" = "$(printf 'f:42\nmatch')"

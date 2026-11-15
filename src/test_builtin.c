@@ -1,225 +1,252 @@
+#define _DEFAULT_SOURCE           /* S_ISVTX under -std=c11 */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fnmatch.h>
+#include <regex.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include "acsh.h"
 
-/* Implements the POSIX `test` utility (and its `[ ... ]` synonym)
- * natively, rather than relying on an external /usr/bin/test binary
- * happening to exist on the host -- acsh's if/while/until conditions
- * use this constantly (`if test -f x`, `while test $i -lt 10`), so
- * this is core functionality, not a nicety.
+/* test / [ / [[: POSIX's rules by argument count, then a full
+ * precedence parser for longer expressions:
  *
- * Supported forms:
- *   test                       -- false (no arguments)
- *   test STRING                -- true if STRING is non-empty
- *   test ! EXPR                -- negation
- *   test STR1 = STR2            test STR1 != STR2
- *   test N1 -eq N2   -ne  -lt  -le  -gt  -ge   (numeric comparisons)
- *   test -z STRING              -n STRING       (empty / non-empty)
- *   test -f PATH   -d PATH   -e PATH   -r/-w/-x PATH   (file tests)
- *   test EXPR1 -a EXPR2          EXPR1 -o EXPR2  (and / or, POSIX-limited
- *                                                  to this simple 2-operand
- *                                                  form -- see note below)
+ *   or  : and ( -o and )*        and  : not ( -a not )*
+ *   not : ! not | primary        primary : ( or ) | -op ARG | ARG op ARG | ARG
  *
- * Scope note: full POSIX test/[ has precedence and grouping rules for
- * combining -a/-o/! across many operands that even real shells warn
- * are ambiguous for more than a few terms. acsh supports the common,
- * unambiguous shapes above; deeply nested combinations (e.g. more
- * than one -a/-o in a single test) are a known limitation. */
+ * [[ ]] is test plus what ash's [[ adds: && and || between tests,
+ * == and != matching shell patterns, and =~ matching an extended
+ * regular expression. Like ash (and unlike bash), its words are split
+ * and globbed as in any command. acsh also accepts ( ) for grouping
+ * and < > as string comparisons inside [[ ]]. */
 
-static int is_numeric(const char *s) {
-    if (*s == '\0') return 0;
-    const char *p = s;
-    if (*p == '-' || *p == '+') p++;
-    if (*p == '\0') return 0;
-    while (*p != '\0') {
-        if (*p < '0' || *p > '9') return 0;
-        p++;
+typedef struct {
+    char **argv;
+    int    argc;
+    int    pos;
+    int    dbl;    /* [[ ]] */
+    int    error;  /* 2 after a reported error */
+} Test;
+
+static void test_error(Test *t, const char *fmt, const char *arg) {
+    if (!t->error) {
+        shell_error_prefix();
+        fprintf(stderr, fmt, arg);
+        fputc('\n', stderr);
     }
-    return 1;
+    t->error = 2;
 }
 
-/* Evaluates a single primary test (no -a/-o combining) starting at
- * argv[*idx], advancing *idx past whatever it consumed. Returns 1
- * (true) or 0 (false); on a malformed expression, prints an error and
- * sets *error to 1. */
-static int eval_primary(int argc, char *argv[], int *idx, int *error) {
-    if (*idx >= argc) {
-        *error = 1;
+static int is_unary(const char *op) {
+    return op[0] == '-' && op[1] != '\0' && op[2] == '\0' && strchr("bcdefgGhkLnOprsStuwxz", op[1]) != NULL;
+}
+
+static int is_binary(Test *t, const char *op) {
+    static const char *ops[] = { "=", "==", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt",
+                                 "-ge", "-nt", "-ot", "-ef", NULL };
+    for (int i = 0; ops[i] != NULL; i++) {
+        if (strcmp(op, ops[i]) == 0) return 1;
+    }
+    return t->dbl && strcmp(op, "=~") == 0;
+}
+
+static long long number(Test *t, const char *s) {
+    char *end;
+    errno = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    long long v = strtoll(s, &end, 10);
+    while (*end == ' ' || *end == '\t') end++;
+    if (*s == '\0' || *end != '\0' || errno != 0) {
+        test_error(t, "%s: bad number", s);
         return 0;
     }
+    return v;
+}
 
-    const char *a = argv[*idx];
-
-    if (strcmp(a, "!") == 0) {
-        (*idx)++;
-        int inner = eval_primary(argc, argv, idx, error);
-        return *error ? 0 : !inner;
-    }
-
-    /* unary operators: OP ARG */
-    if (strcmp(a, "-z") == 0 || strcmp(a, "-n") == 0) {
-        if (*idx + 1 >= argc) { *error = 1; return 0; }
-        const char *val = argv[*idx + 1];
-        *idx += 2;
-        int empty = (val[0] == '\0');
-        return (a[1] == 'z') ? empty : !empty;
-    }
-    if (strcmp(a, "-f") == 0 || strcmp(a, "-d") == 0 || strcmp(a, "-e") == 0 ||
-        strcmp(a, "-r") == 0 || strcmp(a, "-w") == 0 || strcmp(a, "-x") == 0 ||
-        strcmp(a, "-s") == 0) {
-        if (*idx + 1 >= argc) { *error = 1; return 0; }
-        const char *path = argv[*idx + 1];
-    char op = a[1];
-    *idx += 2;
-
+static int unary(Test *t, const char *op, const char *arg) {
     struct stat st;
-    int stat_ok = (stat(path, &st) == 0);
-
-    if (op == 'f') return stat_ok && S_ISREG(st.st_mode);
-    if (op == 'd') return stat_ok && S_ISDIR(st.st_mode);
-    if (op == 'e') return stat_ok;
-    if (op == 'r') return access(path, R_OK) == 0;
-    if (op == 'w') return access(path, W_OK) == 0;
-    if (op == 'x') return access(path, X_OK) == 0;
-    if (op == 's') return stat_ok && st.st_size > 0;
+    char c = op[1];
+    if (c == 'n') return *arg != '\0';
+    if (c == 'z') return *arg == '\0';
+    if (c == 't') return isatty((int)number(t, arg));
+    if (c == 'h' || c == 'L') return lstat(arg, &st) == 0 && S_ISLNK(st.st_mode);
+    if (c == 'r') return access(arg, R_OK) == 0;
+    if (c == 'w') return access(arg, W_OK) == 0;
+    if (c == 'x') return access(arg, X_OK) == 0;
+    if (stat(arg, &st) != 0) return 0;
+    switch (c) {
+    case 'b': return S_ISBLK(st.st_mode);
+    case 'c': return S_ISCHR(st.st_mode);
+    case 'd': return S_ISDIR(st.st_mode);
+    case 'e': return 1;
+    case 'f': return S_ISREG(st.st_mode);
+    case 'g': return (st.st_mode & S_ISGID) != 0;
+    case 'G': return st.st_gid == getegid();
+    case 'k': return (st.st_mode & S_ISVTX) != 0;
+    case 'O': return st.st_uid == geteuid();
+    case 'p': return S_ISFIFO(st.st_mode);
+    case 's': return st.st_size > 0;
+    case 'S': return S_ISSOCK(st.st_mode);
+    case 'u': return (st.st_mode & S_ISUID) != 0;
+    }
     return 0;
-        }
-
-        /* binary operators: ARG1 OP ARG2 -- only recognized when the
-         * MIDDLE token is one of these exact operators, so a bare string
-         * that happens to contain e.g. "=" elsewhere isn't misread */
-        if (*idx + 1 < argc) {
-            const char *op = argv[*idx + 1];
-            int is_binary =
-            strcmp(op, "=") == 0 || strcmp(op, "!=") == 0 ||
-            strcmp(op, "-eq") == 0 || strcmp(op, "-ne") == 0 ||
-            strcmp(op, "-lt") == 0 || strcmp(op, "-le") == 0 ||
-            strcmp(op, "-gt") == 0 || strcmp(op, "-ge") == 0;
-            if (is_binary && *idx + 2 < argc) {
-                const char *lhs = argv[*idx];
-                const char *rhs = argv[*idx + 2];
-                *idx += 3;
-
-                if (strcmp(op, "=") == 0) return strcmp(lhs, rhs) == 0;
-                if (strcmp(op, "!=") == 0) return strcmp(lhs, rhs) != 0;
-
-                /* numeric comparisons: both sides must look numeric,
-                 * otherwise this is a usage error (matches POSIX) */
-                if (!is_numeric(lhs) || !is_numeric(rhs)) {
-                    fprintf(stderr, "acsh: test: %s: expected a numeric argument\n",
-                            is_numeric(lhs) ? rhs : lhs);
-                    *error = 1;
-                    return 0;
-                }
-                long l = atol(lhs);
-                long r = atol(rhs);
-                if (strcmp(op, "-eq") == 0) return l == r;
-                if (strcmp(op, "-ne") == 0) return l != r;
-                if (strcmp(op, "-lt") == 0) return l < r;
-                if (strcmp(op, "-le") == 0) return l <= r;
-                if (strcmp(op, "-gt") == 0) return l > r;
-                if (strcmp(op, "-ge") == 0) return l >= r;
-            }
-        }
-
-        /* fallback: a single string argument is true iff non-empty */
-        (*idx)++;
-        return a[0] != '\0';
 }
 
-/* Top-level evaluator: one primary, optionally combined with -a/-o
- * with a SECOND primary (the documented scope limit above). */
-static int eval_test(int argc, char *argv[], int *error) {
-    int idx = 0;
-    int left = eval_primary(argc, argv, &idx, error);
-    if (*error) return 0;
-
-    if (idx < argc && (strcmp(argv[idx], "-a") == 0 || strcmp(argv[idx], "-o") == 0)) {
-        int is_and = (strcmp(argv[idx], "-a") == 0);
-        idx++;
-        int right = eval_primary(argc, argv, &idx, error);
-        if (*error) return 0;
-        return is_and ? (left && right) : (left || right);
+static int binary(Test *t, const char *a, const char *op, const char *b) {
+    if (strcmp(op, "=") == 0 || strcmp(op, "==") == 0) {
+        return t->dbl ? fnmatch(b, a, 0) == 0 : strcmp(a, b) == 0;
     }
+    if (strcmp(op, "!=") == 0) {
+        return t->dbl ? fnmatch(b, a, 0) != 0 : strcmp(a, b) != 0;
+    }
+    if (strcmp(op, "<") == 0) return strcmp(a, b) < 0;
+    if (strcmp(op, ">") == 0) return strcmp(a, b) > 0;
+    if (strcmp(op, "=~") == 0) {
+        regex_t re;
+        if (regcomp(&re, b, REG_EXTENDED | REG_NOSUB) != 0) {
+            test_error(t, "%s: invalid regular expression", b);
+            return 0;
+        }
+        int match = regexec(&re, a, 0, NULL, 0) == 0;
+        regfree(&re);
+        return match;
+    }
+    if (op[1] == 'n' || op[1] == 'o' || (op[1] == 'e' && op[2] == 'f')) {
+        struct stat sa, sb;
+        int ha = stat(a, &sa) == 0, hb = stat(b, &sb) == 0;
+        if (strcmp(op, "-ef") == 0) return ha && hb && sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+        if (strcmp(op, "-nt") == 0) return ha && (!hb || sa.st_mtime > sb.st_mtime);
+        return hb && (!ha || sa.st_mtime < sb.st_mtime); /* -ot */
+    }
+    long long x = number(t, a), y = number(t, b);
+    if (strcmp(op, "-eq") == 0) return x == y;
+    if (strcmp(op, "-ne") == 0) return x != y;
+    if (strcmp(op, "-lt") == 0) return x < y;
+    if (strcmp(op, "-le") == 0) return x <= y;
+    if (strcmp(op, "-gt") == 0) return x > y;
+    return x >= y; /* -ge */
+}
 
-    if (idx != argc) {
-        /* trailing tokens left over -- malformed expression */
-        *error = 1;
+static const char *peek(Test *t, int k) {
+    return (t->pos + k < t->argc) ? t->argv[t->pos + k] : NULL;
+}
+
+static int is_or(Test *t, const char *s)  { return s && (strcmp(s, "-o") == 0 || (t->dbl && strcmp(s, "||") == 0)); }
+static int is_and(Test *t, const char *s) { return s && (strcmp(s, "-a") == 0 || (t->dbl && strcmp(s, "&&") == 0)); }
+
+static int parse_or(Test *t);
+
+static int parse_primary(Test *t) {
+    const char *a = peek(t, 0);
+    if (a == NULL) {
+        test_error(t, "%s", "test: argument expected");
         return 0;
     }
+    /* ARG op ARG comes first, so that `test ( = (` compares strings */
+    const char *op = peek(t, 1);
+    if (op != NULL && is_binary(t, op) && peek(t, 2) != NULL) {
+        t->pos += 3;
+        return binary(t, a, op, t->argv[t->pos - 1]);
+    }
+    if (strcmp(a, "(") == 0) {
+        t->pos++;
+        int v = parse_or(t);
+        if (peek(t, 0) == NULL || strcmp(peek(t, 0), ")") != 0) {
+            test_error(t, "%s", "test: closing ) expected");
+            return 0;
+        }
+        t->pos++;
+        return v;
+    }
+    if (is_unary(a) && peek(t, 1) != NULL) {
+        t->pos += 2;
+        return unary(t, a, t->argv[t->pos - 1]);
+    }
+    t->pos++;
+    return *a != '\0';
+}
 
-    return left;
+static int parse_not(Test *t) {
+    const char *a = peek(t, 0);
+    if (a != NULL && strcmp(a, "!") == 0 && peek(t, 1) != NULL) {
+        t->pos++;
+        return !parse_not(t);
+    }
+    return parse_primary(t);
+}
+
+static int parse_and(Test *t) {
+    int v = parse_not(t);
+    while (is_and(t, peek(t, 0))) {
+        t->pos++;
+        int r = parse_not(t);
+        v = v && r;
+    }
+    return v;
+}
+
+static int parse_or(Test *t) {
+    int v = parse_and(t);
+    while (is_or(t, peek(t, 0))) {
+        t->pos++;
+        int r = parse_and(t);
+        v = v || r;
+    }
+    return v;
+}
+
+/* POSIX's rules for up to four arguments, which settle cases a general
+ * parser would read differently (test ! = x, test -n, ...). */
+static int evaluate(Test *t, int start, int n) {
+    char **a = t->argv + start;
+    switch (n) {
+    case 0:
+        return 0;
+    case 1:
+        return *a[0] != '\0';
+    case 2:
+        if (strcmp(a[0], "!") == 0) return *a[1] == '\0';
+        if (is_unary(a[0])) return unary(t, a[0], a[1]);
+        break;
+    case 3:
+        if (is_binary(t, a[1])) return binary(t, a[0], a[1], a[2]);
+        if (strcmp(a[0], "!") == 0) return !evaluate(t, start + 1, 2);
+        if (strcmp(a[0], "(") == 0 && strcmp(a[2], ")") == 0) return *a[1] != '\0';
+        if (is_and(t, a[1])) return *a[0] != '\0' && *a[2] != '\0';
+        if (is_or(t, a[1])) return *a[0] != '\0' || *a[2] != '\0';
+        break;
+    case 4:
+        if (strcmp(a[0], "!") == 0) return !evaluate(t, start + 1, 3);
+        if (strcmp(a[0], "(") == 0 && strcmp(a[3], ")") == 0) return evaluate(t, start + 1, 2);
+        break;
+    }
+    t->pos = start;
+    int v = parse_or(t);
+    if (!t->error && t->pos < start + n) {
+        test_error(t, "%s: unknown operand", t->argv[t->pos]);
+    }
+    return v;
 }
 
 int builtin_test(Command *cmd) {
+    const char *name = cmd->argv[0];
     int argc = cmd->argc;
-    char **argv = cmd->argv;
-
-    /* strip argv[0] ("test", "[", or "[["), and for "[" / "[[" require
-     * and strip a matching trailing "]" / "]]" */
-    int start = 1;
-    int end = argc;
-
-    if (strcmp(argv[0], "[") == 0) {
-        if (argc < 2 || strcmp(argv[argc - 1], "]") != 0) {
-            fprintf(stderr, "acsh: [: missing closing ']'\n");
+    Test t = { cmd->argv, argc, 1, 0, 0 };
+    if (strcmp(name, "[") == 0 || strcmp(name, "[[") == 0) {
+        const char *close = (name[1] == '[') ? "]]" : "]";
+        if (argc < 2 || strcmp(cmd->argv[argc - 1], close) != 0) {
+            shell_error("%s: missing %s\n", name, close);
             return 2;
         }
-        end = argc - 1;
-    } else if (strcmp(argv[0], "[[") == 0) {
-        /* [[ ... ]] is bash/ksh syntax, not POSIX test -- acsh
-         * accepts it as a synonym for test/[ using the SAME operator
-         * set (see eval_primary() above), plus normalizing == to =
-         * below, since that's the one [[ ]]-specific spelling people
-         * reach for constantly. Bash's other [[ ]]-only features
-         * (=~ regex matching, unquoted word-splitting-safe variable
-         * expansion, pattern matching against glob-style patterns in
-         * ==) are NOT implemented -- a documented scope limitation,
-         * same spirit as test's own -a/-o limitation noted above. */
-        if (argc < 2 || strcmp(argv[argc - 1], "]]") != 0) {
-            fprintf(stderr, "acsh: [[: missing closing ']]'\n");
-            return 2;
-        }
-        end = argc - 1;
+        t.dbl = (name[1] == '[');
+        argc--;
+        t.argc = argc;
     }
-
-    int inner_argc = end - start;
-    if (inner_argc == 0) {
-        return 1; /* `test` with no arguments is false */
-    }
-
-    /* A copy of the argument pointers with == normalized to =, rather
-     * than overwriting argv[] in place: argv[] entries are heap strings
-     * the executor frees afterwards, so putting a string literal there
-     * would make that free() crash. */
-    char **normalized = malloc((size_t)inner_argc * sizeof(char *));
-    if (normalized == NULL) {
-        fprintf(stderr, "acsh: out of memory\n");
+    int v = evaluate(&t, 1, argc - 1);
+    if (t.error) {
         return 2;
     }
-    int norm_count = inner_argc;
-    for (int i = 0; i < norm_count; i++) {
-        normalized[i] = (strcmp(argv[start + i], "==") == 0)
-        ? (char *)"=" : argv[start + i];
-    }
-
-    int error = 0;
-    int result = eval_test(norm_count, normalized, &error);
-    free(normalized);
-    if (error) {
-        fprintf(stderr, "acsh: test: malformed expression:");
-        for (int i = start; i < end; i++) {
-            fprintf(stderr, " %s", argv[i]);
-        }
-        fprintf(stderr, "\n"
-        "  acsh: supported forms: test STR | test STR1 = STR2 | test N1 -eq N2\n"
-        "  acsh:                  test -z STR | test -f/-d/-e PATH | test ! EXPR\n");
-        return 2;
-    }
-
-    return result ? 0 : 1;
+    return v ? 0 : 1;
 }

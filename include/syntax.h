@@ -14,25 +14,28 @@
 #include <stddef.h>
 
 /* Marker bytes inside a word (see lexer.c). */
-#define SQ_START       '\x01'  /* start of quoted text: no expansion, no globbing */
-#define SQ_END         '\x02'  /* end of quoted text */
-#define QUOTED_FIRST   '\x03'  /* prefix: the word's first character was quoted (no ~) */
-#define ESCAPED_DOLLAR '\x04'  /* a \$ inside double quotes: a literal $ */
+#define SQ_START '\x01'  /* single-quoted or escaped text: taken literally */
+#define SQ_END   '\x02'
+#define DQ_START '\x05'  /* double-quoted text: expanded, never split or globbed */
+#define DQ_END   '\x06'
 
 /* ---- syntax tree ---- */
 
 typedef enum {
     R_IN,       /* [n]<word    */
-    R_OUT,      /* [n]>word, [n]>|word */
+    R_OUT,      /* [n]>word */
+    R_CLOBBER,  /* [n]>|word: overwrites even under set -C */
     R_APPEND,   /* [n]>>word   */
     R_RDWR,     /* [n]<>word   */
-    R_DUP       /* [n]<&word, [n]>&word ("-" closes n) */
+    R_DUP,      /* [n]<&word, [n]>&word ("-" closes n) */
+    R_HEREDOC   /* [n]<<word, [n]<<-word: target holds the body */
 } RedirKind;
 
 typedef struct Redir {
     int           fd;      /* the fd being redirected (0-9) */
     RedirKind     kind;
-    char         *target;  /* word, still marked; expanded when applied */
+    char         *target;  /* word, still marked; expanded when applied (for
+                            * R_HEREDOC: the body, marked like a word) */
     struct Redir *next;
 } Redir;
 
@@ -59,12 +62,14 @@ typedef struct CaseItem {
     char           **patterns;  /* marked words */
     int              npatterns;
     Node            *body;      /* may be NULL (empty clause) */
+    int              fallthrough; /* ended by ;& : the next body runs too */
     struct CaseItem *next;
 } CaseItem;
 
 struct Node {
     NodeKind kind;
     int      refs;     /* function bodies are shared with the function table */
+    int      lineno;   /* source line where the command starts ($LINENO) */
     Redir   *redirs;   /* N_SIMPLE and compound commands */
     char    *text;     /* source text of a pipeline / background job, for `jobs` */
     union {
@@ -97,7 +102,27 @@ typedef struct Lexer Lexer;
 /* A lexer over lines from `source` (may be NULL: then `text` is all the
  * input there is). `name` prefixes error messages ("script.sh"). */
 Lexer *lexer_new(const char *text, LineSource source, void *ctx, const char *name);
+
+/* Decodes raw shell text (the inside of ${x:-word} or $((...))) into
+ * marked form, as if it were one word; with dquoted, as if it stood
+ * inside double quotes. Returns a heap string, or NULL on a quoting
+ * error (reported). */
+char *lex_mark(const char *raw, int dquoted);
 void   lexer_free(Lexer *lx);
+
+/* Finds the ')' that closes a $( ... ): fed every character outside
+ * quotes (after the opening parenthesis), it counts parentheses but
+ * skips the ')' ending a case pattern (`case x in a) ...`), which has
+ * no '('. Start from a zeroed ParenScan with depth 1. */
+typedef struct {
+    int  depth;
+    int  case_at[16], case_state[16], ncase; /* open `case`s: depth, 0 word 1 subject 2 in */
+    char word[8];
+    int  wlen;
+    int  cmd_start;  /* the next word is in command position */
+} ParenScan;
+void paren_scan_init(ParenScan *ps);
+int  paren_scan(ParenScan *ps, int c); /* 1: c is the closing ')' */
 
 /* ---- parser ---- */
 

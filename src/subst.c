@@ -1,9 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include "acsh.h"
 
@@ -63,7 +65,7 @@ char *command_substitute(const char *cmd) {
     char *out = malloc(cap);
     if (out == NULL) {
         close(pipefd[0]);
-        waitpid(pid, NULL, 0);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
         unblock_sigchld();
         return NULL;
     }
@@ -82,7 +84,7 @@ char *command_substitute(const char *cmd) {
             if (bigger == NULL) {
                 free(out);
                 close(pipefd[0]);
-                waitpid(pid, NULL, 0);
+                while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
                 unblock_sigchld();
                 return NULL;
             }
@@ -90,6 +92,7 @@ char *command_substitute(const char *cmd) {
         }
         ssize_t n = read(pipefd[0], out + len, cap - len - 1);
         if (n < 0) {
+            if (errno == EINTR) continue; /* a trapped signal arrived */
             break;
         }
         if (n == 0) {
@@ -100,7 +103,7 @@ char *command_substitute(const char *cmd) {
     close(pipefd[0]);
 
     int status = 0;
-    waitpid(pid, &status, 0);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
     if (WIFEXITED(status)) {
         env_set_last_status(WEXITSTATUS(status));
     }
@@ -113,4 +116,60 @@ char *command_substitute(const char *cmd) {
     }
     out[len] = '\0';
     return out;
+}
+
+/* ---- process substitution ---- */
+
+/* The shell's ends of <(...) and >(...) pipes, open until the command
+ * that used them finishes (process_close_from). */
+static int subst_fds[64];
+static int subst_count = 0;
+
+int process_substitute(const char *cmd, int to_cmd) {
+    int p[2];
+    if (subst_count >= (int)(sizeof(subst_fds) / sizeof(subst_fds[0]))) {
+        shell_error("too many process substitutions\n");
+        return -1;
+    }
+    if (pipe(p) < 0) {
+        shell_error("pipe: %s\n", strerror(errno));
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        shell_error("fork: %s\n", strerror(errno));
+        close(p[0]);
+        close(p[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        /* >(cmd) reads what the command writes; <(cmd) writes for it */
+        dup2(to_cmd ? p[0] : p[1], to_cmd ? STDIN_FILENO : STDOUT_FILENO);
+        close(p[0]);
+        close(p[1]);
+        for (int k = 0; k < subst_count; k++) close(subst_fds[k]);
+        child_setup_subshell();
+        int status = run_string(cmd);
+        fflush(stdout);
+        _exit(status & 0xff);
+    }
+    int keep = to_cmd ? p[1] : p[0];
+    close(to_cmd ? p[0] : p[1]);
+    /* above the 0-9 that redirections use, so `3<file` cannot clobber it */
+    int fd = fcntl(keep, F_DUPFD, 60);
+    if (fd >= 0) {
+        close(keep);
+    } else {
+        fd = keep;
+    }
+    subst_fds[subst_count++] = fd;
+    return fd;
+}
+
+int process_subst_mark(void) {
+    return subst_count;
+}
+
+void process_close_from(int mark) {
+    while (subst_count > mark) close(subst_fds[--subst_count]);
 }

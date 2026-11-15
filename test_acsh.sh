@@ -50,14 +50,14 @@ echo "--- Section 1: beyond-ash features (README claims) ---"
 echo ""
 echo "[1.1] Default aliases in an interactive session, none in scripts"
 echo "alias" > /tmp/acsh_test_alias_input
-./acsh < /tmp/acsh_test_alias_input > /tmp/acsh_test_alias_check 2>&1
-if grep -q "alias ll=" /tmp/acsh_test_alias_check
+./acsh -i < /tmp/acsh_test_alias_input > /tmp/acsh_test_alias_check 2>&1
+if grep -q "ll='ls" /tmp/acsh_test_alias_check
 then
     check_eq "default alias ll is defined at startup" "yes" "yes"
 else
     check_eq "default alias ll is defined at startup" "yes" "no"
 fi
-if grep -q "alias la=" /tmp/acsh_test_alias_check
+if grep -q "la='ls" /tmp/acsh_test_alias_check
 then
     check_eq "default alias la is defined at startup" "yes" "yes"
 else
@@ -73,7 +73,7 @@ export HOME=/tmp/acsh_test_home
 mkdir -p $HOME
 echo "echo history-probe-line" > /tmp/acsh_test_hist_input
 echo "exit" >> /tmp/acsh_test_hist_input
-./acsh < /tmp/acsh_test_hist_input > /dev/null 2>&1
+./acsh -i < /tmp/acsh_test_hist_input > /dev/null 2>&1
 if test -f $HOME/.acsh_history
 then
     grep -q "history-probe-line" $HOME/.acsh_history
@@ -97,7 +97,7 @@ mkdir -p $HOME
 echo "export ACSH_RC_PROBE=loaded" > $HOME/.acshrc
 echo "echo rc-value: \$ACSH_RC_PROBE" > /tmp/acsh_test_rc_input
 echo "exit" >> /tmp/acsh_test_rc_input
-./acsh < /tmp/acsh_test_rc_input > /tmp/acsh_test_rc_output 2>&1
+./acsh -i < /tmp/acsh_test_rc_input > /tmp/acsh_test_rc_output 2>&1
 grep -q "rc-value: loaded" /tmp/acsh_test_rc_output
 if test $? -eq 0
 then
@@ -113,7 +113,7 @@ echo "if true" > /tmp/acsh_test_syntax_input
 echo "echo oops" >> /tmp/acsh_test_syntax_input
 echo "fi" >> /tmp/acsh_test_syntax_input
 echo "exit" >> /tmp/acsh_test_syntax_input
-./acsh < /tmp/acsh_test_syntax_input > /tmp/acsh_test_syntax_output 2>&1
+./acsh -i < /tmp/acsh_test_syntax_input > /tmp/acsh_test_syntax_output 2>&1
 grep -q "usage:" /tmp/acsh_test_syntax_output
 if test $? -eq 0
 then
@@ -124,7 +124,7 @@ fi
 rm -f /tmp/acsh_test_syntax_input /tmp/acsh_test_syntax_output
 
 echo ""
-echo "[1.5] [[ ]] extended test (not present in ash at all)"
+echo "[1.5] [[ ]] extended test"
 if [[ hello = hello ]]
 then
     check_eq "[[ ]] basic equality" "yes" "yes"
@@ -417,14 +417,110 @@ unalias acsh_test_alias_cmd
 echo ""
 echo "[2.20] Builtins work as pipeline stages"
 alias acsh_pipe_alias="echo x"
-RESULT=$(alias | grep "^alias acsh_pipe_alias=" | wc -l)
+RESULT=$(alias | grep "^acsh_pipe_alias=" | wc -l)
 check_eq "builtin (alias) piped into grep" "1" "$RESULT"
 
 echo ""
 echo "[2.21] fg returns the job's exit status"
-sh -c "sleep 0.1; exit 3" > /dev/null &
-fg > /dev/null
-check_eq "fg reports the job's real status" "3" "$?"
+RESULT=$(printf 'sh -c "sleep 0.1; exit 3" > /dev/null &\nfg > /dev/null\necho "fg=$?"\n' | ./acsh -i 2>/dev/null)
+check_eq "fg reports the job's real status" "fg=3" "$RESULT"
+sleep 0.1 &
+fg 2>/dev/null
+check_eq "fg in a script (no job control) fails with 2, as in ash" "2" "$?"
+
+echo ""
+echo "[2.22] Invocation: -c with arguments, piped stdin without a prompt"
+RESULT=$(./acsh -c 'echo "$0 $1 $#"' name one two)
+check_eq "-c sets \$0 and the arguments" "name one 2" "$RESULT"
+RESULT=$(echo 'echo piped' | ./acsh 2>&1)
+check_eq "piped stdin runs without a prompt" "piped" "$RESULT"
+RESULT=$(echo 'echo "$1 $#"' | ./acsh -s x y)
+check_eq "-s takes arguments for stdin commands" "x 2" "$RESULT"
+./acsh /nonexistent/acsh-script 2>/dev/null
+check_eq "a missing script exits 2, as in ash" "2" "$?"
+
+echo ""
+echo "[2.23] Login shells read ~/.profile"
+export HOME=/tmp/acsh_test_login_home
+mkdir -p $HOME
+echo "ACSH_PROFILE_PROBE=from-profile" > $HOME/.profile
+RESULT=$(./acsh -lc 'echo $ACSH_PROFILE_PROBE' 2>/dev/null)
+check_eq "-l reads ~/.profile" "from-profile" "$RESULT"
+RESULT=$(./acsh -c 'echo "[$ACSH_PROFILE_PROBE]"')
+check_eq "a non-login shell does not" "[]" "$RESULT"
+rm -rf $HOME
+
+echo ""
+echo "[2.24] [[ ]] extensions beyond ash: grouping and string < >"
+if [[ a = a && ( b = c || d = d ) ]]
+then
+    check_eq "[[ ]] groups with parentheses" "yes" "yes"
+else
+    check_eq "[[ ]] groups with parentheses" "yes" "no"
+fi
+if [[ abc < abd ]]
+then
+    check_eq "[[ ]] compares strings with <" "yes" "yes"
+else
+    check_eq "[[ ]] compares strings with <" "yes" "no"
+fi
+
+echo ""
+echo "[2.25] Replacement anchors and \"\${@:n:m}\" (beyond ash)"
+x=hello
+check_eq "\${x/#h/H} anchors at the start" "Hello" "${x/#h/H}"
+check_eq "\${x/%o/O} anchors at the end" "hellO" "${x/%o/O}"
+slice_args() { for a in "${@:2:2}"; do printf "[%s]" "$a"; done; }
+RESULT=$(slice_args a b c d)
+check_eq "\"\${@:2:2}\" keeps both words" "[b][c]" "$RESULT"
+
+echo ""
+echo "[2.26] Errors name the script and line"
+printf 'echo ok\nno_such_cmd_probe\n' > /tmp/acsh_test_err.sh
+RESULT=$(./acsh /tmp/acsh_test_err.sh 2>&1 | grep -c "acsh_test_err.sh: line 2: no_such_cmd_probe: command not found")
+check_eq "runtime error carries file and line" "1" "$RESULT"
+printf 'echo ok\nif true\necho oops\nfi\n' > /tmp/acsh_test_err.sh
+RESULT=$(./acsh /tmp/acsh_test_err.sh 2>&1 | grep -c "acsh_test_err.sh: line 4: syntax error: expected 'then'")
+check_eq "syntax error carries file and line" "1" "$RESULT"
+rm -f /tmp/acsh_test_err.sh
+
+echo ""
+echo "[2.27] Syntax beyond ash: ;& fall-through, &>>, bash escapes in \$'...'"
+RESULT=$(case a in a) printf 1;& b) printf 2;; c) printf 3;; esac)
+check_eq ";& runs the next clause too (POSIX.1-2024)" "12" "$RESULT"
+rm -f /tmp/acsh_test_amp.out
+echo one &>> /tmp/acsh_test_amp.out
+ls /nonexistent-acsh-probe &>> /tmp/acsh_test_amp.out
+RESULT=$(wc -l < /tmp/acsh_test_amp.out | tr -d ' ')
+check_eq "&>> appends stdout and stderr" "2" "$RESULT"
+rm -f /tmp/acsh_test_amp.out
+RESULT=$(printf '%s' $'é\e' | od -An -tx1 | tr -d ' \n')
+check_eq "\$'\\u00e9\\e' gives UTF-8 and ESC" "c3a91b" "$RESULT"
+RESULT=$(printf '%s' $'a\0b')
+check_eq "\$'...' ends at \\0, as in bash" "a" "$RESULT"
+RESULT=$(./acsh -c 'trap "echo hi" INT; trap -p INT; trap -p TERM')
+check_eq "trap -p SIGNAL lists that trap (POSIX.1-2024)" "trap -- 'echo hi' INT" "$RESULT"
+
+echo ""
+echo "[2.28] \$ENV is run by interactive shells"
+printf 'X_FROM_ENV=yes\n' > /tmp/acsh_test_env.sh
+RESULT=$(echo 'echo "[$X_FROM_ENV]"' | ENV=/tmp/acsh_test_env.sh ./acsh -i 2>/dev/null)
+check_eq "interactive shell runs \$ENV" "[yes]" "$RESULT"
+RESULT=$(echo 'echo "[$X_FROM_ENV]"' | ENV=/tmp/acsh_test_env.sh ./acsh 2>/dev/null)
+check_eq "a non-interactive shell does not" "[]" "$RESULT"
+rm -f /tmp/acsh_test_env.sh
+RESULT=$(env -i ./acsh -c 'echo "$PATH"')
+check_eq "an unset PATH gets ash's default" "/sbin:/usr/sbin:/bin:/usr/bin" "$RESULT"
+
+
+echo ""
+echo "[2.29] POSIX signal rules for scripts"
+RESULT=$( (trap '' INT; ./acsh -c 'trap "echo caught" INT; kill -INT $$; echo after') 2>&1)
+check_eq "a signal ignored on entry cannot be trapped" "after" "$RESULT"
+RESULT=$(./acsh -c 'sleep 2 & p=$!; sleep 0.3; kill -INT $p; wait $p; echo "st=$?"')
+check_eq "a background job in a script ignores SIGINT" "st=0" "$RESULT"
+RESULT=$(./acsh -c 'trap "" INT; sh -c "kill -INT \$\$; echo survived"')
+check_eq "trap '' INT is inherited by commands" "survived" "$RESULT"
 
 echo ""
 echo "=================================================="

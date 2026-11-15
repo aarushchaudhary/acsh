@@ -1,3 +1,4 @@
+#define _DEFAULT_SOURCE           /* SIGWINCH and friends under -std=c11 */
 #define _POSIX_C_SOURCE 200809L  /* sigaction, kill, getpgid under -std=c11 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,7 +6,59 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <ctype.h>
+#include <strings.h>
 #include "acsh.h"
+
+/* ---- signal names (kill, trap) ---- */
+
+static const struct { const char *name; int num; } SIGNALS[] = {
+    { "HUP", SIGHUP }, { "INT", SIGINT }, { "QUIT", SIGQUIT }, { "ILL", SIGILL },
+    { "TRAP", SIGTRAP }, { "ABRT", SIGABRT }, { "BUS", SIGBUS }, { "FPE", SIGFPE },
+    { "KILL", SIGKILL }, { "USR1", SIGUSR1 }, { "SEGV", SIGSEGV }, { "USR2", SIGUSR2 },
+    { "PIPE", SIGPIPE }, { "ALRM", SIGALRM }, { "TERM", SIGTERM },
+#ifdef SIGSTKFLT
+    { "STKFLT", SIGSTKFLT },
+#endif
+    { "CHLD", SIGCHLD }, { "CONT", SIGCONT }, { "STOP", SIGSTOP }, { "TSTP", SIGTSTP },
+    { "TTIN", SIGTTIN }, { "TTOU", SIGTTOU }, { "URG", SIGURG }, { "XCPU", SIGXCPU },
+    { "XFSZ", SIGXFSZ }, { "VTALRM", SIGVTALRM }, { "PROF", SIGPROF }, { "WINCH", SIGWINCH },
+#ifdef SIGIO
+    { "IO", SIGIO },
+#endif
+#ifdef SIGPWR
+    { "PWR", SIGPWR },
+#endif
+    { "SYS", SIGSYS },
+    { NULL, 0 }
+};
+
+int signal_number(const char *s) {
+    if (isdigit((unsigned char)*s)) {
+        char *end;
+        long n = strtol(s, &end, 10);
+        return (*end == '\0' && n >= 0 && n < NSIG) ? (int)n : -1;
+    }
+    if (strncasecmp(s, "SIG", 3) == 0) s += 3;
+    for (int i = 0; SIGNALS[i].name != NULL; i++) {
+        if (strcasecmp(s, SIGNALS[i].name) == 0) return SIGNALS[i].num;
+    }
+    return -1;
+}
+
+const char *signal_name(int num) {
+    for (int i = 0; SIGNALS[i].name != NULL; i++) {
+        if (SIGNALS[i].num == num) return SIGNALS[i].name;
+    }
+    return NULL;
+}
+
+void signal_list(void) {
+    for (int n = 1; n < NSIG; n++) {
+        const char *name = signal_name(n);
+        if (name != NULL) printf("%2d) %s\n", n, name);
+    }
+}
 
 /* The shell needs to know which process group is currently running in
  * the foreground so that Ctrl+C/Ctrl+Z can be routed to it instead of
@@ -17,62 +70,203 @@ void set_foreground_pgid(pid_t pgid) {
     foreground_pgid = pgid;
 }
 
-/* trap command storage for INT and EXIT (the two signals/pseudo-
- * signals acsh supports trapping -- see the scope note on
- * builtin_trap() in builtins.c for why the full POSIX trap signal
- * list isn't implemented). The handler itself does NOT run the
- * trapped command directly: running arbitrary shell code (which forks,
- * allocates, etc.) from inside a signal handler is not async-signal-
- * safe and can corrupt the shell's own state if the signal arrives
- * mid-allocation elsewhere. Instead, sigint_handler() just raises a
- * flag (int_trap_pending), and main.c's REPL loop checks and clears
- * that flag BETWEEN commands, running the trapped command from
- * ordinary (non-signal-handler) context where it's safe to do so. */
-static char *int_trap_command = NULL;
-static volatile sig_atomic_t int_trap_pending = 0;
-static char *exit_trap_command = NULL;
+/* ---- traps ----
+ *
+ * trap_cmd[sig] is the action for a signal: NULL = default, "" =
+ * ignored, otherwise a command. A trapped signal only marks itself
+ * pending in the handler; the command runs between commands
+ * (trap_run_pending), never inside the handler, where running shell
+ * code is not safe. EXIT runs as the shell exits, ERR when a command
+ * fails (under the same rules as set -e). */
 
-void trap_set_int(const char *command) {
-    free(int_trap_command);
-    int_trap_command = (command != NULL) ? strdup(command) : NULL;
+static char *trap_cmd[NSIG];
+static char *exit_trap = NULL;
+static char *err_trap = NULL;
+static volatile sig_atomic_t pending[NSIG];
+static volatile sig_atomic_t any_pending = 0;
+
+static void trap_handler(int sig) {
+    pending[sig] = 1;
+    any_pending = 1;
 }
 
-void trap_set_exit(const char *command) {
-    free(exit_trap_command);
-    exit_trap_command = (command != NULL) ? strdup(command) : NULL;
+/* Signals ignored when a non-interactive shell started (or, in an
+ * asynchronous command, SIGINT and SIGQUIT): POSIX says they stay
+ * ignored -- trap cannot catch or reset them, and children inherit it. */
+static unsigned char locked_ignored[NSIG];
+
+void signal_lock_ignored(int sig) {
+    locked_ignored[sig] = 1;
+    signal(sig, SIG_IGN);
 }
 
-/* Called from main.c's REPL loop, between commands, to run the INT
- * trap if one fired since the last check. Returns 1 if it ran a trap
- * (so main.c can re-prompt cleanly), 0 otherwise. */
-int trap_check_and_run_int(void) {
-    if (!int_trap_pending) {
+void signal_default(int sig) {
+    signal(sig, locked_ignored[sig] ? SIG_IGN : SIG_DFL);
+}
+
+/* The handler a signal gets when it has no user trap. */
+static void default_disposition(int sig) {
+    if (sig == SIGINT || sig == SIGCHLD || sig == SIGTSTP) {
+        return; /* the shell's own handlers stay; they consult trap_cmd */
+    }
+    if (job_control_enabled() &&
+        (sig == SIGTTOU || sig == SIGTTIN || sig == SIGQUIT || sig == SIGTERM)) {
+        signal(sig, SIG_IGN); /* an interactive shell ignores these */
+        return;
+    }
+    signal_default(sig);
+}
+
+int trap_is_ignored(int sig) {
+    return sig > 0 && sig < NSIG && trap_cmd[sig] != NULL && *trap_cmd[sig] == '\0';
+}
+
+static void install_shell_handler(int sig);
+
+int trap_set(const char *spec, const char *action) {
+    if (strcmp(spec, "EXIT") == 0 || strcmp(spec, "0") == 0) {
+        free(exit_trap);
+        exit_trap = action ? strdup(action) : NULL;
         return 0;
     }
-    int_trap_pending = 0;
-    if (int_trap_command != NULL) {
-        /* run a copy: the trap may reset itself with `trap - INT` */
-        char *cmd = strdup(int_trap_command);
-        int saved = env_get_last_status();
-        if (cmd != NULL) run_string(cmd);
-        free(cmd);
-        env_set_last_status(saved); /* a trap does not change $? */
+    if (strcmp(spec, "ERR") == 0) {
+        free(err_trap);
+        err_trap = action ? strdup(action) : NULL;
+        return 0;
     }
-    return 1;
+    int sig = signal_number(spec);
+    if (sig <= 0) {
+        return -1;
+    }
+    if (locked_ignored[sig]) {
+        return 0; /* ignored on entry: silently stays ignored (POSIX) */
+    }
+    free(trap_cmd[sig]);
+    trap_cmd[sig] = action ? strdup(action) : NULL;
+    if (sig == SIGKILL || sig == SIGSTOP) {
+        return 0; /* cannot be caught or ignored; nothing to install */
+    }
+    if (sig == SIGINT || sig == SIGTSTP) {
+        /* trap '' really ignores it, so commands inherit that; otherwise
+         * the shell's own handler runs (and consults trap_cmd) */
+        if (action != NULL && *action == '\0') signal(sig, SIG_IGN);
+        else install_shell_handler(sig);
+        return 0;
+    }
+    if (sig == SIGCHLD) {
+        return 0; /* the shell's own handler stays; it consults trap_cmd */
+    }
+    if (action == NULL) {
+        default_disposition(sig);
+    } else if (*action == '\0') {
+        signal(sig, SIG_IGN);
+    } else {
+        struct sigaction sa;
+        sa.sa_handler = trap_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0; /* no SA_RESTART: a trapped signal interrupts `wait` */
+        sigaction(sig, &sa, NULL);
+    }
+    return 0;
 }
 
-/* Called once from main.c right before the shell exits, to run the
- * EXIT trap if one was set -- this is what lets a script register
- * cleanup code (e.g. removing a temp file) that always runs on exit,
- * regardless of how the script got there. */
+int trap_pending_signal(void) {
+    if (!any_pending) return 0;
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (pending[sig]) return sig;
+    }
+    return 0;
+}
+
+static void run_trap_command(const char *cmd) {
+    char *copy = strdup(cmd);   /* the trap may reset itself */
+    int saved = env_get_last_status();
+    if (copy != NULL) run_string(copy);
+    free(copy);
+    env_set_last_status(saved); /* a trap does not change $? */
+}
+
+int trap_run_pending(void) {
+    if (!any_pending) {
+        return 0;
+    }
+    any_pending = 0;
+    int ran = 0;
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (!pending[sig]) continue;
+        pending[sig] = 0;
+        if (trap_cmd[sig] != NULL && *trap_cmd[sig] != '\0') {
+            run_trap_command(trap_cmd[sig]);
+            ran = 1;
+        }
+    }
+    return ran;
+}
+
 void trap_run_exit(void) {
-    if (exit_trap_command != NULL) {
+    if (exit_trap != NULL) {
         /* cleared first, so an `exit` inside the trap cannot run it again */
-        char *cmd = exit_trap_command;
-        exit_trap_command = NULL;
+        char *cmd = exit_trap;
+        exit_trap = NULL;
         run_string(cmd);
         free(cmd);
     }
+}
+
+void trap_run_err(void) {
+    if (err_trap != NULL && *err_trap != '\0') {
+        run_trap_command(err_trap);
+    }
+}
+
+void trap_reset_for_subshell(void) {
+    /* POSIX: a subshell keeps ignored signals ignored; traps with a
+     * command go back to the default */
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (trap_cmd[sig] != NULL && *trap_cmd[sig] != '\0') {
+            free(trap_cmd[sig]);
+            trap_cmd[sig] = NULL;
+            default_disposition(sig);
+        }
+        pending[sig] = 0;
+    }
+    any_pending = 0;
+    free(exit_trap);
+    exit_trap = NULL;
+    free(err_trap);
+    err_trap = NULL;
+}
+
+static void print_trap(const char *cmd, const char *name) {
+    fputs("trap -- '", stdout);
+    for (const char *c = cmd; *c; c++) {
+        if (*c == '\'') fputs("'\"'\"'", stdout);
+        else putchar(*c);
+    }
+    printf("' %s\n", name);
+}
+
+void trap_print(void) {
+    if (exit_trap != NULL) print_trap(exit_trap, "EXIT");
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (trap_cmd[sig] != NULL && signal_name(sig) != NULL) print_trap(trap_cmd[sig], signal_name(sig));
+    }
+    if (err_trap != NULL) print_trap(err_trap, "ERR");
+}
+
+int trap_print_one(const char *spec) {
+    if (strcmp(spec, "EXIT") == 0 || strcmp(spec, "0") == 0) {
+        if (exit_trap != NULL) print_trap(exit_trap, "EXIT");
+        return 0;
+    }
+    if (strcmp(spec, "ERR") == 0) {
+        if (err_trap != NULL) print_trap(err_trap, "ERR");
+        return 0;
+    }
+    int sig = signal_number(spec);
+    if (sig <= 0) return -1;
+    if (trap_cmd[sig] != NULL) print_trap(trap_cmd[sig], signal_name(sig));
+    return 0;
 }
 
 /* Blocks/unblocks SIGCHLD around the shell's own fork()/waitpid()
@@ -138,11 +332,14 @@ void shell_clear_interrupted(void) {
  * one, mark the shell interrupted so running loops and lists stop.
  * Only touches sig_atomic_t flags, so it is safe in the handler. */
 void shell_note_sigint(void) {
-    if (int_trap_command != NULL) {
-        int_trap_pending = 1;
-    } else {
+    const char *t = trap_cmd[SIGINT];
+    if (t == NULL) {
         interrupted = 1;
+    } else if (*t != '\0') {
+        pending[SIGINT] = 1;
+        any_pending = 1;
     }
+    /* trap '' INT: ignored */
 }
 
 static void sigint_handler(int signo) {
@@ -162,7 +359,24 @@ static void sigtstp_handler(int signo) {
     }
 }
 
+static void install_shell_handler(int sig) {
+    struct sigaction sa;
+    sa.sa_handler = (sig == SIGINT) ? sigint_handler : sigtstp_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(sig, &sa, NULL);
+}
+
 void signals_init(void) {
+    if (!shell_is_interactive()) {
+        for (int sig = 1; sig < NSIG; sig++) {
+            struct sigaction old;
+            if (sig != SIGKILL && sig != SIGSTOP && sig != SIGCHLD &&
+                sigaction(sig, NULL, &old) == 0 && old.sa_handler == SIG_IGN) {
+                locked_ignored[sig] = 1;
+            }
+        }
+    }
     struct sigaction sa_chld;
     sa_chld.sa_handler = sigchld_handler;
     sigemptyset(&sa_chld.sa_mask);
@@ -173,11 +387,11 @@ void signals_init(void) {
     sa_int.sa_handler = sigint_handler;
     sigemptyset(&sa_int.sa_mask);
     sa_int.sa_flags = SA_RESTART;
-    sigaction(SIGINT, &sa_int, NULL);
+    if (!locked_ignored[SIGINT]) sigaction(SIGINT, &sa_int, NULL);
 
     struct sigaction sa_tstp;
     sa_tstp.sa_handler = sigtstp_handler;
     sigemptyset(&sa_tstp.sa_mask);
     sa_tstp.sa_flags = SA_RESTART;
-    sigaction(SIGTSTP, &sa_tstp, NULL);
+    if (!locked_ignored[SIGTSTP]) sigaction(SIGTSTP, &sa_tstp, NULL);
 }

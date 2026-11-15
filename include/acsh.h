@@ -2,6 +2,7 @@
 #define ACSH_H
 
 #include <sys/types.h>  /* pid_t */
+#include <termios.h>    /* struct termios (Job) */
 
 /* acsh: a POSIX-style shell aiming to be a lighter, friendlier ash.
  *
@@ -13,8 +14,9 @@
  *                if/while/until/for/case, break/continue/return
  *   builtins.c   cd, export, read, trap, ...    test_builtin.c: test / [ / [[
  *   functions.c  shell functions
- *   env.c        $VAR / $? / $1 expansion, positional parameters, locals
- *   glob.c       pathname expansion             subst.c: $(...) and `...`
+ *   expand.c     word expansion: $x ${x...} $(...) $((...)), $IFS splitting, globbing
+ *   env.c        parameters ($?, $1, $#, ...), positional parameters, locals
+ *   subst.c      $(...) and `...`
  *   jobs.c       the job table                  signals.c: SIGCHLD/SIGINT/SIGTSTP, traps
  *   alias.c      aliases                        history.c: command history */
 
@@ -40,14 +42,25 @@ int try_run_builtin(Command *cmd, int *exit_status);
 /* 1 if `name` is a builtin (without running it). */
 int is_builtin_name(const char *name);
 
-/* ---- test_builtin.c: test / [ / [[ ---- */
+/* 1 for POSIX special builtins (: . break eval exec exit export ...). */
+int is_special_builtin(const char *name);
+
+/* ---- test_builtin.c: test / [ / [[ ;  printf.c: echo, printf ---- */
 int builtin_test(Command *cmd);
+int builtin_echo(Command *cmd);
+int builtin_printf(Command *cmd);
 
 /* ---- exec.c ---- */
 
 /* Runs `text` as shell commands in this shell (eval, traps, $(...)).
  * Returns the last command's status, or 2 on a syntax error. */
 int run_string(const char *text);
+
+/* Error messages: "acsh: FILE: line N: <message>" while running a
+ * script (or -c), plain "acsh: <message>" at the prompt. fmt includes
+ * its own trailing newline. */
+void shell_error(const char *fmt, ...);
+void shell_error_prefix(void);   /* just the prefix, for messages built in pieces */
 
 /* Runs an external command (no function or builtin lookup) in the
  * foreground and returns its status. Used by the `command` builtin. */
@@ -76,6 +89,12 @@ int  control_flow_unwinding(void);
 /* Drops any pending break/continue/return (between top-level commands). */
 void control_flow_reset(void);
 
+/* Around reading a file (script, `.`, profile): a `return` outside any
+ * function then ends that file instead of the shell. */
+void control_flow_enter_file(void);
+void control_flow_leave_file(void);
+int  control_flow_in_file(void);
+
 /* ---- jobs.c ---- */
 
 typedef enum {
@@ -97,6 +116,11 @@ typedef struct {
     int      notify;      /* state changed; not yet reported */
     int      remaining;   /* processes not yet exited */
     int      last_status; /* exit code of the last process, once it exits */
+    int      signaled;    /* the signal that killed the last process, or 0 */
+    int      seq;         /* recency, for the current (%+) and previous (%-) job */
+    int      has_tmodes;  /* tmodes holds its terminal settings (saved when stopped) */
+    int      own_group;   /* started under job control: pgid is a real process group */
+    struct termios tmodes;
 } Job;
 
 /* Registers a job; returns its id, or -1 if the table is full. */
@@ -125,11 +149,31 @@ void jobs_report_changes(void);
 /* Frees finished jobs (after `jobs` has shown them). */
 void jobs_cleanup_done(void);
 
+/* A job spec: %n, %+ / %% / % (current), %- (previous), %name (command
+ * starts with name), %?text (command contains text). NULL if none. */
+Job *jobs_resolve(const char *spec);
 Job *jobs_find_by_id(int id);      /* job "%id", or NULL */
+Job *jobs_find_by_pid(pid_t pid);  /* the job a process belongs to, or NULL */
+Job *jobs_at(int index);           /* slot 0..ACSH_MAX_JOBS-1 if in use, else NULL */
 Job *jobs_find_most_recent(void);  /* newest job, or NULL */
-void jobs_print_all(void);         /* the `jobs` listing */
+void jobs_print_all(int with_pid, int pids_only);  /* jobs, jobs -l, jobs -p */
+
+/* Job control (interactive shells only): on a terminal the shell takes
+ * its own process group and the terminal, and ignores SIGTTOU, SIGTTIN,
+ * SIGQUIT and SIGTERM; each foreground job gets the terminal while it
+ * runs, with its own terminal settings restored on fg. */
+void job_control_init(void);
+int  job_control_enabled(void);
+void terminal_give(Job *j, pid_t pgid);   /* to a foreground job (j may be NULL) */
+void terminal_take_back(Job *stopped);    /* back to the shell; saves a stopped job's settings */
 
 /* ---- signals.c ---- */
+
+/* Signal names without "SIG": "TERM" <-> 15. signal_number() also
+ * takes "SIGTERM", "term" and "15"; it returns -1 if unknown. */
+int         signal_number(const char *name);
+const char *signal_name(int num);   /* NULL if unknown */
+void        signal_list(void);      /* " 1) HUP" ... (kill -l) */
 
 /* Installs the shell's SIGCHLD, SIGINT and SIGTSTP handlers. */
 void signals_init(void);
@@ -142,13 +186,21 @@ void set_foreground_pgid(pid_t pgid);
 void block_sigchld(void);
 void unblock_sigchld(void);
 
-/* Traps: acsh supports INT and EXIT. Trap commands never run inside a
- * signal handler: SIGINT only queues the trap, and it runs between
- * commands (trap_check_and_run_int). */
-void trap_set_int(const char *command);
-void trap_set_exit(const char *command);
-int  trap_check_and_run_int(void);  /* 1 if a queued INT trap ran */
-void trap_run_exit(void);           /* once, as the shell exits */
+/* Traps. A trapped signal is only marked pending by its handler; the
+ * command runs between commands (trap_run_pending), never inside the
+ * handler. spec: a signal name or number, EXIT/0, or ERR. action: a
+ * command, "" to ignore the signal, NULL for the default. */
+int  trap_set(const char *spec, const char *action);  /* -1: unknown signal */
+int  trap_run_pending(void);      /* runs queued traps; 1 if any ran */
+int  trap_pending_signal(void);   /* a queued trapped signal, or 0 */
+int  trap_is_ignored(int sig);    /* trap '' SIG */
+void trap_run_exit(void);         /* once, as the shell exits */
+void trap_run_err(void);          /* after a failing command (rules of set -e) */
+void trap_reset_for_subshell(void);
+void signal_lock_ignored(int sig); /* ignore sig for good (POSIX entry-ignored rule) */
+void signal_default(int sig);      /* SIG_DFL, or SIG_IGN if locked ignored */
+void trap_print(void);            /* trap -- 'cmd' NAME ... */
+int  trap_print_one(const char *spec); /* trap -p SIG; -1: no such signal */
 
 /* Ctrl+C: with no INT trap, SIGINT that reaches the shell (or kills the
  * foreground job) marks the shell interrupted, and running loops and
@@ -157,15 +209,45 @@ int  shell_interrupted(void);
 void shell_clear_interrupted(void);
 void shell_note_sigint(void);
 
+/* ---- vars.c: shell variables ----
+ *
+ * All variables live in one table. Exported ones (export, set -a, or
+ * inherited from the environment) are passed to commands acsh runs;
+ * the others stay inside the shell. */
+
+#define V_EXPORT   1
+#define V_READONLY 2
+
+void        vars_init(void);                       /* import the environment */
+const char *var_get(const char *name);             /* NULL if unset */
+int         var_set(const char *name, const char *value);  /* -1: read-only (reported) */
+int         var_unset(const char *name);           /* -1: read-only (reported) */
+int         var_flags(const char *name);
+void        var_add_flags(const char *name, int flags);
+void        var_clear_flags(const char *name, int flags);
+int         var_valid_name(const char *name);
+char      **var_environ(void);                     /* "NAME=value" for exported variables */
+
+/* Saves a variable (value and flags, or that it was unset) so a
+ * one-command assignment can be undone with var_restore(). */
+typedef struct {
+    char *name;
+    char *value;
+    int   flags;
+    int   existed;
+} VarSave;
+VarSave var_save(const char *name);
+void    var_restore(VarSave *s);
+
+/* `set` (all, as name='value'), `export -p`, `readonly -p` listings. */
+enum { VARS_ALL, VARS_EXPORTED, VARS_READONLY };
+void var_print(int which);
+
 /* ---- env.c: variables and expansion ----
  *
  * Variables live in the process environment (setenv), so every
  * variable is visible to commands acsh runs. */
 
-/* Expands $VAR, ${VAR}, $?, $1..$9, $#, $@, $(...) and `...` in a
- * marked word (see syntax.h), plus a leading ~. Quoted regions stay
- * marked so glob_expand() leaves them alone. Returns a heap string. */
-char *env_expand(const char *word);
 
 void env_set_last_status(int status);
 int  env_get_last_status(void);
@@ -176,6 +258,17 @@ void env_pop_positional_params(void);
 int  env_shift_positional_params(int n);
 int  env_set_positional_params(int argc, char *argv[]);  /* set -- ARGS */
 int  env_positional_count(void);
+
+/* Startup: $0 = name, $1.. = argv[0..argc-1], $$ = this process. */
+void env_init(const char *name, int argc, char *argv[]);
+void env_set_last_background(pid_t pid);  /* $! */
+void env_seed_random(unsigned long seed);  /* RANDOM=N */
+void env_set_lineno(int line);             /* $LINENO */
+int  env_get_lineno(void);
+
+/* The value of parameter `name` (a variable, $1.., or one of
+ * # ? @ * $ ! - 0) as a heap string, or NULL if it is unset. */
+char *env_param_value(const char *name);
 const char *env_positional(int i);  /* $i, 1-based; "" if unset */
 
 /* `local` variables: a frame per function call, restored on return. */
@@ -186,19 +279,38 @@ int  env_declare_local(const char *name, const char *value);
 /* How many function calls are nested (for the recursion limit). */
 int env_get_call_depth(void);
 
-/* ---- glob.c: pathname expansion (*, ?, [abc]) ----
+/* ---- expand.c: word expansion ----
  *
- * Expands an expanded word into a new heap array of strings (*results)
- * and returns how many: every match, sorted, or the word itself (quote
- * markers removed) when it has no unquoted glob characters or nothing
- * matches. The caller frees each string and the array. */
-int glob_expand(const char *word, char ***results);
+ * Words come from the lexer in marked form (see syntax.h). Expansion
+ * runs tilde, parameter, command, arithmetic expansion, then field
+ * splitting on $IFS, globbing (unless set -f) and quote removal. On an
+ * expansion error (${x?}, $((1/0)), bad substitution) a message is
+ * printed and these return -1 / NULL. */
+
+/* Words -> fields: a new NULL-terminated heap array (*out, *n). */
+int   expand_fields(char **words, int nwords, char ***out, int *n);
+
+/* One word -> one string, no splitting or globbing (assignment values,
+ * redirection targets, case words). assignment: ~ also after ':'. */
+char *expand_string(const char *word, int assignment);
+
+/* One word -> an fnmatch() pattern; quoted characters match literally. */
+char *expand_pattern(const char *word);
+
+/* Evaluates an arithmetic expression ($((...)) syntax, already
+ * expanded); returns -1 after reporting an error. Used by `let`. */
+int arith_evaluate(const char *expr, long *result);
 
 /* ---- subst.c: $(...) and `...` ----
  *
  * Runs cmd in a forked subshell and returns its output (heap) without
  * trailing newlines. Sets $? to the subshell's status. */
 char *command_substitute(const char *cmd);
+/* <(cmd) (to_cmd 0) or >(cmd) (to_cmd 1): starts cmd on a pipe and
+ * returns the shell's end, open until process_close_from(mark). */
+int   process_substitute(const char *cmd, int to_cmd);
+int   process_subst_mark(void);
+void  process_close_from(int mark);
 
 /* ---- functions.c ---- */
 
@@ -224,6 +336,7 @@ void alias_load_defaults(void);
 void alias_set(const char *name, const char *value);
 void alias_unset(const char *name);
 const char *alias_get(const char *name);
+void alias_print(const char *name, const char *value);
 void alias_print_all(void);
 
 /* ---- history.c ----
@@ -247,5 +360,10 @@ int run_script_file(const char *path);
 /* 1 in the interactive shell; 0 in scripts and subshells. */
 int  shell_is_interactive(void);
 void shell_mark_subshell(void);
+
+/* Shell options (set -e, -u, -x, -f, -n, ... and -c, -i, -s at startup). */
+int  shell_option(char c);
+void shell_set_option(char c, int on);
+const char *shell_option_string(void);  /* $- */
 
 #endif /* ACSH_H */

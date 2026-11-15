@@ -10,7 +10,8 @@
 # test starts matching, it is reported as XPASS and DOES fail the run, so
 # the marker gets removed and the fix stays covered from then on.
 # stderr is not compared: the two shells word their error messages differently.
-# A test may raise its time limit with a line "# timeout: SECONDS" (default 30).
+# A test may raise its time limit with a line "# timeout: SECONDS" (default 30),
+# and pass arguments to the script with a line "# args: WORD...".
 
 ACSH=${1:-./acsh}
 ASH=${ASH:-busybox ash}
@@ -26,7 +27,8 @@ pass=0; fail=0; xfail=0; xpass=0
 run_one() { # shell-command test-file output-file
     rm -rf "$work/cwd" && mkdir "$work/cwd"
     limit=$(sed -n 's/^# timeout: *\([0-9][0-9]*\).*/\1/p' "$2" | head -1)
-    (cd "$work/cwd" && timeout "${limit:-$TIMEOUT}" $1 "$2" </dev/null >"$3" 2>/dev/null; echo "exit=$?" >>"$3")
+    args=$(sed -n 's/^# args: *//p' "$2" | head -1)
+    (cd "$work/cwd" && timeout "${limit:-$TIMEOUT}" $1 "$2" $args </dev/null >"$3" 2>/dev/null; echo "exit=$?" >>"$3")
 }
 
 for t in "$here"/diff/*.sh; do

@@ -38,7 +38,7 @@ void alias_set(const char *name, const char *value) {
             return;
         }
     }
-    fprintf(stderr, "acsh: alias table full\n");
+    shell_error("alias table full\n");
 }
 
 void alias_unset(const char *name) {
@@ -59,10 +59,20 @@ const char *alias_get(const char *name) {
     return NULL;
 }
 
+/* name='value' in ash's form, a ' inside written as '"'"' */
+void alias_print(const char *name, const char *value) {
+    printf("%s='", name);
+    for (const char *c = value; *c; c++) {
+        if (*c == '\'') fputs("'\"'\"'", stdout);
+        else putchar(*c);
+    }
+    puts("'");
+}
+
 void alias_print_all(void) {
     for (int i = 0; i < ACSH_MAX_ALIASES; i++) {
         if (alias_table[i].in_use) {
-            printf("alias %s='%s'\n", alias_table[i].name, alias_table[i].value);
+            alias_print(alias_table[i].name, alias_table[i].value);
         }
     }
 }

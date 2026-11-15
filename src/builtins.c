@@ -1,36 +1,20 @@
-#define _POSIX_C_SOURCE 200809L  /* kill() under -std=c11 */
+#define _DEFAULT_SOURCE           /* Linux resource limits (RLIMIT_NICE, ...) */
+#define _POSIX_C_SOURCE 200809L  /* kill(), strsignal() under -std=c11 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/times.h>
+#include <poll.h>
+#include <termios.h>
+#include <ctype.h>
 #include "acsh.h"
-
-/* Single source of truth for "is NAME a builtin", used by the `type`
- * and `command -v` builtins below. Kept as an explicit list (rather
- * than, say, deriving it from try_run_builtin()'s dispatch chain
- * automatically) because C has no clean way to introspect that chain
- * -- this list must be kept in sync with it by hand. It mirrors
- * try_run_builtin()'s strcmp() chain exactly as of this writing. */
-static const char *BUILTIN_NAMES[] = {
-    "break", "continue", "test", "[", "[[", "cd", "exit", "pwd", "jobs", "fg", "bg",
-    "export", "unset", "alias", "unalias", "history", "source", ".",
-    "read", "exec", "umask", "type", "command", "shift", "local", "set", "eval", "trap",
-    "return",
-    NULL
-};
-
-int is_builtin_name(const char *name) {
-    for (int i = 0; BUILTIN_NAMES[i] != NULL; i++) {
-        if (strcmp(BUILTIN_NAMES[i], name) == 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
 
 /* Searches $PATH for `name`, the same way execvp() would, and returns
  * a newly malloc'd full path if found, or NULL if not. Used by `type`
@@ -45,7 +29,7 @@ static char *find_in_path(const char *name) {
         return NULL;
     }
 
-    const char *path_env = getenv("PATH");
+    const char *path_env = var_get("PATH");
     if (path_env == NULL) {
         return NULL;
     }
@@ -71,16 +55,107 @@ static char *find_in_path(const char *name) {
     return result;
 }
 
+static int pwd_is_current(const char *pwd);
+
+/* Joins dir onto base and removes "." and ".." lexically, as a logical
+ * cd does: /a/link/.. is /a, whatever link points to. */
+static char *logical_path(const char *base, const char *dir) {
+    size_t n = strlen(base) + strlen(dir) + 3;
+    char *joined = malloc(n);
+    if (dir[0] == '/') snprintf(joined, n, "%s", dir);
+    else snprintf(joined, n, "%s/%s", base, dir);
+    char *out = malloc(n);
+    size_t k = 0;
+    out[k++] = '/';
+    for (char *part = strtok(joined, "/"); part != NULL; part = strtok(NULL, "/")) {
+        if (strcmp(part, ".") == 0) continue;
+        if (strcmp(part, "..") == 0) {
+            if (k > 1) {
+                k--;                                /* drop the trailing '/' */
+                while (k > 1 && out[k - 1] != '/') k--;
+            }
+            continue;
+        }
+        size_t l = strlen(part);
+        memcpy(out + k, part, l);
+        k += l;
+        out[k++] = '/';
+    }
+    if (k > 1) k--;
+    out[k] = '\0';
+    free(joined);
+    return out;
+}
+
+/* Changes to dir, logically (from $PWD) unless physical; sets $PWD and
+ * $OLDPWD on success. */
+static int change_dir(const char *dir, int physical) {
+    char cwd[4096];
+    const char *pwd = var_get("PWD");
+    if (!pwd_is_current(pwd)) pwd = getcwd(cwd, sizeof(cwd));
+    char *old = strdup(pwd != NULL ? pwd : "");
+    char *target = (!physical && pwd != NULL) ? logical_path(pwd, dir) : strdup(dir);
+    int r = chdir(target);
+    if (r == 0) {
+        if (*old) var_set("OLDPWD", old);
+        if (physical || pwd == NULL) {
+            if (getcwd(cwd, sizeof(cwd)) != NULL) var_set("PWD", cwd);
+        } else {
+            var_set("PWD", target);
+        }
+    }
+    free(old);
+    free(target);
+    return r;
+}
+
+/* cd [-L | -P] [DIR | -]: no DIR means $HOME, - means $OLDPWD (and
+ * prints it). A relative DIR is also looked up in $CDPATH. -P resolves
+ * symlinks; the default (-L) keeps the path as typed. */
 static int builtin_cd(Command *cmd) {
-    const char *target = (cmd->argc > 1) ? cmd->argv[1] : getenv("HOME");
+    int i = 1, physical = 0;
+    for (; i < cmd->argc && cmd->argv[i][0] == '-' && cmd->argv[i][1]; i++) {
+        if (strcmp(cmd->argv[i], "-P") == 0) physical = 1;
+        else if (strcmp(cmd->argv[i], "-L") == 0) physical = 0;
+        else if (strcmp(cmd->argv[i], "--") == 0) { i++; break; }
+        else break; /* "-" itself, or a directory starting with '-' */
+    }
+    const char *target = (i < cmd->argc) ? cmd->argv[i] : var_get("HOME");
+    int print = 0;
+    if (target != NULL && strcmp(target, "-") == 0) {
+        target = var_get("OLDPWD");
+        print = 1;
+        if (target == NULL) {
+            shell_error("cd: OLDPWD not set\n");
+            return 1;
+        }
+    }
     if (target == NULL) {
-        fprintf(stderr, "acsh: cd: HOME not set\n");
+        shell_error("cd: HOME not set\n");
         return 1;
     }
-    if (chdir(target) != 0) {
-        perror("acsh: cd");
-        return 1;
+    int ok = 0;
+    const char *cdpath = var_get("CDPATH");
+    if (target[0] != '/' && strncmp(target, "./", 2) != 0 && strncmp(target, "../", 3) != 0 &&
+        strcmp(target, ".") != 0 && strcmp(target, "..") != 0 && cdpath != NULL) {
+        char *copy = strdup(cdpath);
+        for (char *dir = copy, *next; dir != NULL && !ok; dir = next) {
+            next = strchr(dir, ':');
+            if (next != NULL) *next++ = '\0';
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/%s", *dir ? dir : ".", target);
+            if (change_dir(path, physical) == 0) {
+                ok = 1;
+                if (*dir) print = 1; /* found through CDPATH: show where */
+            }
+        }
+        free(copy);
     }
+    if (!ok && change_dir(target, physical) != 0) {
+        shell_error("cd: can't cd to %s: %s\n", target, strerror(errno));
+        return 2;
+    }
+    if (print) printf("%s\n", var_get("PWD"));
     return 0;
 }
 
@@ -91,7 +166,7 @@ static int parse_number(const char *who, const char *s, long min, long *out) {
     errno = 0;
     long v = strtol(s, &end, 10);
     if (*s == '\0' || *end != '\0' || errno != 0 || v < min) {
-        fprintf(stderr, "acsh: %s: Illegal number: %s\n", who, s);
+        shell_error("%s: Illegal number: %s\n", who, s);
         return -1;
     }
     *out = v;
@@ -124,43 +199,70 @@ static int builtin_exit(Command *cmd) {
     return 0; /* unreachable */
 }
 
-static int builtin_pwd(void) {
-    char cwd[1024];
+/* The logical current directory ($PWD) if it still names the current
+ * directory, else the physical one. */
+static int pwd_is_current(const char *pwd) {
+    struct stat a, b;
+    return pwd != NULL && pwd[0] == '/' && stat(pwd, &a) == 0 && stat(".", &b) == 0 &&
+           a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
+
+/* pwd [-L | -P]: -L (default) shows the path as reached through
+ * symlinks ($PWD), -P the physical path. */
+static int builtin_pwd(Command *cmd) {
+    int physical = 0;
+    for (int i = 1; i < cmd->argc; i++) {
+        if (strcmp(cmd->argv[i], "-P") == 0) physical = 1;
+        else if (strcmp(cmd->argv[i], "-L") == 0) physical = 0;
+    }
+    const char *pwd = var_get("PWD");
+    if (!physical && pwd_is_current(pwd)) {
+        printf("%s\n", pwd);
+        return 0;
+    }
+    char cwd[4096];
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
         printf("%s\n", cwd);
         return 0;
     }
-    perror("acsh: pwd");
+    shell_error("pwd: %s\n", strerror(errno));
     return 1;
 }
 
-static int builtin_jobs(void) {
-    jobs_print_all();
-    jobs_cleanup_done();
+/* jobs [-l | -p]: the job table, current (+) and previous (-) first. */
+static int builtin_jobs(Command *cmd) {
+    int with_pid = 0, pids_only = 0;
+    for (int i = 1; i < cmd->argc; i++) {
+        if (strcmp(cmd->argv[i], "-l") == 0) with_pid = 1;
+        else if (strcmp(cmd->argv[i], "-p") == 0) pids_only = 1;
+        else {
+            shell_error("jobs: illegal option %s\n", cmd->argv[i]);
+            return 2;
+        }
+    }
+    jobs_print_all(with_pid, pids_only);
     return 0;
 }
 
-/* Parses a "%N" or plain "N" job-id argument. If no argument is given,
- * falls back to the most recently added job (matches bash behaviour
- * for bare `fg`/`bg`). Returns NULL if nothing matches. */
-static Job *resolve_job_arg(Command *cmd) {
-    if (cmd->argc < 2) {
-        return jobs_find_most_recent();
+/* The job an fg/bg operand names (default: the current job). */
+static Job *job_operand(Command *cmd, const char *who) {
+    if (!job_control_enabled()) {
+        shell_error("%s: job control is not enabled (not an interactive shell)\n", who);
+        return NULL;
     }
-    const char *arg = cmd->argv[1];
-    if (arg[0] == '%') {
-        arg++;
+    Job *j = jobs_resolve(cmd->argc > 1 ? cmd->argv[1] : NULL);
+    if (j == NULL) {
+        shell_error("%s: %s: no such job\n", who, cmd->argc > 1 ? cmd->argv[1] : "current");
     }
-    return jobs_find_by_id(atoi(arg));
+    return j;
 }
 
+/* fg [%job]: continues a job in the foreground, with the terminal. */
 static int builtin_fg(Command *cmd) {
-    Job *j = resolve_job_arg(cmd);
+    Job *j = job_operand(cmd, "fg");
     if (j == NULL) {
-        fprintf(stderr, "acsh: fg: no such job\n");
-        return 1;
+        return job_control_enabled() ? 1 : 2;
     }
-
     printf("%s\n", j->cmdline);
     fflush(stdout);
 
@@ -174,103 +276,111 @@ static int builtin_fg(Command *cmd) {
         return code;
     }
     jobs_mark_running(j->pgid);
-    kill(-j->pgid, SIGCONT);
+    terminal_give(j, j->pgid);
     set_foreground_pgid(j->pgid);
+    kill(-j->pgid, SIGCONT);
 
-    int code = 0;
+    int code = 0, stopped = 0;
     while (j->remaining > 0) {
         int status;
         pid_t w = waitpid(-j->pgid, &status, WUNTRACED);
         if (w < 0) {
+            if (errno == EINTR) continue;
             break;
         }
         if (WIFSTOPPED(status)) {
             jobs_mark_stopped(j->pgid);
             code = 128 + WSTOPSIG(status);
+            stopped = 1;
             break;
         }
         jobs_child_exited(w, status);
     }
+    set_foreground_pgid(0);
+    terminal_take_back(stopped ? j : NULL);
     if (j->state == JOB_DONE) {
         code = j->last_status;
         jobs_remove(j);
     }
-    set_foreground_pgid(0);
     unblock_sigchld();
     return code;
 }
 
+/* bg [%job]: continues a stopped job in the background. */
 static int builtin_bg(Command *cmd) {
-    Job *j = resolve_job_arg(cmd);
+    Job *j = job_operand(cmd, "bg");
     if (j == NULL) {
-        fprintf(stderr, "acsh: bg: no such job\n");
-        return 1;
+        return job_control_enabled() ? 1 : 2;
     }
-    kill(-j->pgid, SIGCONT);
     jobs_mark_running(j->pgid);
-    printf("[%d] %s &\n", j->id, j->cmdline);
+    kill(-j->pgid, SIGCONT);
+    printf("[%d] %s\n", j->id, j->cmdline);
     return 0;
 }
 
-/* `export NAME=value` sets a real process environment variable, so
- * $NAME becomes visible both to acsh's own $VAR expansion (env.c) and
- * to any program acsh execs afterwards -- setenv() affects the
- * process's environ[], which is inherited by every child via fork().
- * `export NAME` (no =value) with no existing value exports it as
- * empty, matching common shell behaviour for that form. Multiple
- * NAME=value pairs on one line are all applied. */
-static int builtin_export(Command *cmd) {
-    if (cmd->argc < 2) {
-        /* bare `export` with no args: POSIX says list all exported
-         * vars; skipped for this mini-project, just a no-op */
+/* `export NAME[=value]...` marks variables for the environment of the
+ * commands acsh runs; `readonly NAME[=value]...` makes them read-only.
+ * With no names, or -p, they list (`export -p` prints lines that can be
+ * run again). Both are special builtins: an error ends a script. */
+static int export_or_readonly(Command *cmd, int flag, const char *who) {
+    int i = 1, remove = 0;
+    if (i < cmd->argc && strcmp(cmd->argv[i], "-p") == 0) i++;
+    else if (flag == V_EXPORT && i < cmd->argc && strcmp(cmd->argv[i], "-n") == 0) {
+        remove = 1; /* export -n NAME: keep the variable, stop exporting it */
+        i++;
+    }
+    if (i >= cmd->argc) {
+        var_print(flag == V_EXPORT ? VARS_EXPORTED : VARS_READONLY);
         return 0;
     }
-
-    int status = 0;
-    for (int i = 1; i < cmd->argc; i++) {
+    for (; i < cmd->argc; i++) {
         char *arg = cmd->argv[i];
         char *eq = strchr(arg, '=');
-
-        if (eq != NULL) {
-            size_t name_len = (size_t)(eq - arg);
-            char name[256];
-            if (name_len >= sizeof(name)) {
-                fprintf(stderr, "acsh: export: variable name too long\n");
-                status = 1;
-                continue;
-            }
-            memcpy(name, arg, name_len);
-            name[name_len] = '\0';
-
-            if (setenv(name, eq + 1, 1) != 0) {
-                perror("acsh: export");
-                status = 1;
-            }
-        } else {
-            /* bare NAME: export with current value if set, else empty */
-            const char *existing = getenv(arg);
-            if (setenv(arg, existing != NULL ? existing : "", 1) != 0) {
-                perror("acsh: export");
-                status = 1;
-            }
+        char *name = eq ? strndup(arg, (size_t)(eq - arg)) : strdup(arg);
+        if (!var_valid_name(name)) {
+            shell_error("%s: %s: bad variable name\n", who, name);
+            free(name);
+            return special_builtin_error();
         }
+        if (eq != NULL && var_set(name, eq + 1) != 0) {
+            free(name);
+            return special_builtin_error();
+        }
+        if (remove) var_clear_flags(name, V_EXPORT);
+        else var_add_flags(name, flag);
+        free(name);
     }
-    return status;
+    return 0;
 }
 
+static int builtin_export(Command *cmd) {
+    return export_or_readonly(cmd, V_EXPORT, "export");
+}
+
+static int builtin_readonly(Command *cmd) {
+    return export_or_readonly(cmd, V_READONLY, "readonly");
+}
+
+/* `unset [-v] NAME...` removes variables; `unset -f NAME...` functions. */
 static int builtin_unset(Command *cmd) {
-    if (cmd->argc < 2) {
-        fprintf(stderr, "acsh: unset: usage: unset NAME [NAME ...]\n");
-        return 1;
-    }
-    int status = 0;
-    for (int i = 1; i < cmd->argc; i++) {
-        if (unsetenv(cmd->argv[i]) != 0) {
-            perror("acsh: unset");
-            status = 1;
+    int i = 1, functions = 0;
+    for (; i < cmd->argc && cmd->argv[i][0] == '-'; i++) {
+        if (strcmp(cmd->argv[i], "-f") == 0) functions = 1;
+        else if (strcmp(cmd->argv[i], "-v") == 0) functions = 0;
+        else if (strcmp(cmd->argv[i], "--") == 0) { i++; break; }
+        else {
+            shell_error("unset: illegal option %s\n", cmd->argv[i]);
+            return special_builtin_error();
         }
     }
-    return status;
+    for (; i < cmd->argc; i++) {
+        if (functions) {
+            function_undefine(cmd->argv[i]);
+        } else if (var_unset(cmd->argv[i]) != 0) {
+            return special_builtin_error();
+        }
+    }
+    return 0;
 }
 
 static int builtin_alias(Command *cmd) {
@@ -285,16 +395,16 @@ static int builtin_alias(Command *cmd) {
             /* `alias name` with no = : show just that one alias */
             const char *val = alias_get(arg);
             if (val != NULL) {
-                printf("alias %s='%s'\n", arg, val);
+                alias_print(arg, val);
             } else {
-                fprintf(stderr, "acsh: alias: %s: not found\n", arg);
+                shell_error("alias: %s: not found\n", arg);
             }
             continue;
         }
         size_t name_len = (size_t)(eq - arg);
         char name[64];
         if (name_len >= sizeof(name)) {
-            fprintf(stderr, "acsh: alias: name too long\n");
+            shell_error("alias: name too long\n");
             continue;
         }
         memcpy(name, arg, name_len);
@@ -306,7 +416,7 @@ static int builtin_alias(Command *cmd) {
 
 static int builtin_unalias(Command *cmd) {
     if (cmd->argc < 2) {
-        fprintf(stderr, "acsh: unalias: usage: unalias NAME [NAME ...]\n");
+        shell_error("unalias: usage: unalias NAME [NAME ...]\n");
         return 1;
     }
     for (int i = 1; i < cmd->argc; i++) {
@@ -344,25 +454,66 @@ static int builtin_history(void) {
  * octal (e.g. "0022"); `umask MODE` sets it. Uses the real umask()
  * syscall, so this genuinely affects permissions of files created by
  * anything run afterwards -- not just a cosmetic setting. */
+/* umask [-S] [MODE]: MODE is octal (022) or symbolic (u=rwx,g=rx,o=,
+ * a-w, g+w), as in ash; -S shows the mask as permissions. */
 static int builtin_umask(Command *cmd) {
-    if (cmd->argc <= 1) {
-        /* umask() itself both sets AND returns the old value, so to
-         * just READ the current mask without changing it, set it to
-         * some value and immediately set it back to what that call
-         * reported as the previous mask */
-        mode_t current = umask(0);
-        umask(current);
-        printf("%04o\n", current);
+    int symbolic = 0, i = 1;
+    if (i < cmd->argc && strcmp(cmd->argv[i], "-S") == 0) { symbolic = 1; i++; }
+    mode_t mask = umask(0);
+    umask(mask);
+    if (i >= cmd->argc) {
+        if (!symbolic) {
+            printf("%04o\n", (unsigned)mask);
+            return 0;
+        }
+        mode_t perm = ~mask & 0777;
+        const char *who = "ugo";
+        for (int w = 0; w < 3; w++) {
+            int bits = (perm >> (6 - 3 * w)) & 7;
+            printf("%c=%s%s%s%s", who[w], (bits & 4) ? "r" : "", (bits & 2) ? "w" : "",
+                   (bits & 1) ? "x" : "", w < 2 ? "," : "\n");
+        }
         return 0;
     }
-
-    char *endptr;
-    long mode = strtol(cmd->argv[1], &endptr, 8);
-    if (*endptr != '\0' || mode < 0 || mode > 0777) {
-        fprintf(stderr, "acsh: umask: illegal mode: %s\n", cmd->argv[1]);
-        return 2;
+    const char *m = cmd->argv[i];
+    if (*m >= '0' && *m <= '7') {
+        char *end;
+        long mode = strtol(m, &end, 8);
+        if (*end != '\0' || mode < 0 || mode > 0777) {
+            shell_error("umask: illegal mode: %s\n", m);
+            return 2;
+        }
+        umask((mode_t)mode);
+        return 0;
     }
-    umask((mode_t)mode);
+    mode_t perm = ~mask & 0777;
+    while (*m) {
+        mode_t who = 0;
+        for (; *m && strchr("ugoa", *m); m++) {
+            who |= (*m == 'u') ? 0700 : (*m == 'g') ? 0070 : (*m == 'o') ? 0007 : 0777;
+        }
+        if (who == 0) who = 0777;
+        char op = *m;
+        if (op != '=' && op != '+' && op != '-') {
+            shell_error("umask: illegal mode: %s\n", cmd->argv[i]);
+            return 2;
+        }
+        m++;
+        mode_t bits = 0;
+        for (; *m && strchr("rwx", *m); m++) {
+            bits |= (*m == 'r') ? 0444 : (*m == 'w') ? 0222 : 0111;
+        }
+        bits &= who;
+        if (op == '=') perm = (perm & ~who) | bits;
+        else if (op == '+') perm |= bits;
+        else perm &= ~bits;
+        if (*m == ',') m++;
+        else if (*m) {
+            shell_error("umask: illegal mode: %s\n", cmd->argv[i]);
+            return 2;
+        }
+    }
+    umask(~perm & 0777);
     return 0;
 }
 
@@ -373,18 +524,30 @@ static int builtin_umask(Command *cmd) {
  * informational, which is the whole point of `type` as distinct from
  * just trying to run NAME and seeing what happens. */
 static int builtin_type(Command *cmd) {
-    if (cmd->argc <= 1) {
-        fprintf(stderr, "acsh: type: usage: type NAME [NAME ...]\n");
+    int paths_only = 0, first = 1;
+    if (cmd->argc > 1 && strcmp(cmd->argv[1], "-p") == 0) {
+        paths_only = 1; /* type -p: only the path of external commands */
+        first = 2;
+    }
+    if (cmd->argc <= first) {
+        shell_error("type: usage: type [-p] NAME [NAME ...]\n");
         return 1;
     }
 
     int any_not_found = 0;
-    for (int i = 1; i < cmd->argc; i++) {
+    for (int i = first; i < cmd->argc; i++) {
         const char *name = cmd->argv[i];
+        if (paths_only) {
+            char *path = (alias_get(name) || function_is_defined(name) || is_builtin_name(name))
+                         ? NULL : find_in_path(name);
+            if (path != NULL) printf("%s\n", path);
+            free(path);
+            continue;
+        }
 
         const char *alias_val = alias_get(name);
         if (alias_val != NULL) {
-            printf("%s is aliased to '%s'\n", name, alias_val);
+            printf("%s is an alias for %s\n", name, alias_val);
             continue;
         }
         if (function_is_defined(name)) {
@@ -392,7 +555,7 @@ static int builtin_type(Command *cmd) {
             continue;
         }
         if (is_builtin_name(name)) {
-            printf("%s is a shell builtin\n", name);
+            printf("%s is a %sshell builtin\n", name, is_special_builtin(name) ? "special " : "");
             continue;
         }
         char *path = find_in_path(name);
@@ -401,7 +564,7 @@ static int builtin_type(Command *cmd) {
             free(path);
             continue;
         }
-        fprintf(stderr, "acsh: type: %s: not found\n", name);
+        shell_error("type: %s: not found\n", name);
         any_not_found = 1;
     }
 
@@ -415,15 +578,48 @@ static int builtin_type(Command *cmd) {
  * would resolve to (like a quieter `type`), without running it, and
  * is commonly used in portable scripts to check whether something
  * exists before using it. acsh implements both forms. */
+static int builtin_command_run(Command *cmd);
+
+/* command [-p] [-v | -V] NAME [ARGS]: -p looks NAME up in the
+ * standard PATH (confstr _CS_PATH) instead of $PATH. */
 static int builtin_command(Command *cmd) {
+    if (cmd->argc > 2 && strcmp(cmd->argv[1], "-p") == 0) {
+        char std[1024];
+        size_t n = confstr(_CS_PATH, std, sizeof(std));
+        if (n == 0 || n > sizeof(std)) snprintf(std, sizeof(std), "/usr/bin:/bin:/usr/sbin:/sbin");
+        VarSave saved = var_save("PATH");
+        int ro = var_flags("PATH") & V_READONLY;
+        if (!ro) var_set("PATH", std);
+        char *flag = cmd->argv[1];
+        Command rest = { cmd->argv + 1, cmd->argc - 1, 0 };
+        rest.argv[0] = "command";
+        int status = builtin_command_run(&rest);
+        cmd->argv[1] = flag;
+        if (!ro) var_restore(&saved);
+        else { free(saved.name); free(saved.value); }
+        return status;
+    }
+    return builtin_command_run(cmd);
+}
+
+static int builtin_command_run(Command *cmd) {
     if (cmd->argc <= 1) {
-        fprintf(stderr, "acsh: command: usage: command [-v] NAME [ARGS ...]\n");
+        shell_error("command: usage: command [-p] [-v | -V] NAME [ARGS ...]\n");
         return 1;
     }
 
+    if (strcmp(cmd->argv[1], "-V") == 0) {
+        /* command -V NAME: describes NAME as `type` does */
+        char *saved = cmd->argv[1];
+        Command t = { cmd->argv + 1, cmd->argc - 1, 0 };
+        t.argv[0] = "type";
+        int status = builtin_type(&t);
+        cmd->argv[1] = saved;
+        return status;
+    }
     if (strcmp(cmd->argv[1], "-v") == 0) {
         if (cmd->argc <= 2) {
-            fprintf(stderr, "acsh: command: -v: usage: command -v NAME\n");
+            shell_error("command: -v: usage: command -v NAME\n");
             return 1;
         }
         const char *name = cmd->argv[2];
@@ -471,9 +667,9 @@ static int builtin_exec(Command *cmd) {
 
     /* only reached if execvp failed */
     if (errno == ENOENT) {
-        fprintf(stderr, "acsh: exec: %s: command not found\n", cmd->argv[1]);
+        shell_error("exec: %s: command not found\n", cmd->argv[1]);
     } else {
-        fprintf(stderr, "acsh: exec: %s: %s\n", cmd->argv[1], strerror(errno));
+        shell_error("exec: %s: %s\n", cmd->argv[1], strerror(errno));
     }
     /* POSIX: if exec's target can't be found/run, the shell that
      * invoked `exec` (if non-interactive, i.e. a script) must exit;
@@ -515,59 +711,128 @@ static int builtin_exec(Command *cmd) {
  * touches nearly every execution path in the shell, which was judged
  * not to fit this project's scope once control flow, functions, and
  * command substitution were already the priority. */
-/* `trap COMMAND SIGNAME` registers COMMAND to run when SIGNAME
- * occurs; `trap - SIGNAME` (or `trap '' SIGNAME`) resets it to no
- * trap. acsh supports exactly two signal names: INT (Ctrl+C at the
- * prompt) and EXIT (run once when the shell exits) -- see the scope
- * note in acsh.h above the trap_* declarations for why the full
- * POSIX signal set isn't implemented. */
+/* trap [ACTION] SIGNAL...: ACTION is a command, '' to ignore, or - to
+ * restore the default (also when the first operand is a number, as
+ * POSIX says). SIGNAL: a name (TERM, SIGTERM) or number, EXIT/0, ERR.
+ * No operands, or -p: list the traps. */
 static int builtin_trap(Command *cmd) {
-    if (cmd->argc < 3) {
-        fprintf(stderr, "acsh: trap: usage: trap COMMAND SIGNAME   (SIGNAME: INT or EXIT)\n"
-        "  acsh: trap - SIGNAME   to clear a trap\n");
-        return 1;
-    }
-
-    const char *command_arg = cmd->argv[1];
-    const char *signame = cmd->argv[2];
-    int clearing = (strcmp(command_arg, "-") == 0 || command_arg[0] == '\0');
-    const char *command = clearing ? NULL : command_arg;
-
-    if (strcmp(signame, "INT") == 0) {
-        trap_set_int(command);
+    int i = 1;
+    if (i < cmd->argc && strcmp(cmd->argv[i], "--") == 0) i++;
+    if (i >= cmd->argc || (strcmp(cmd->argv[i], "-p") == 0 && i + 1 == cmd->argc)) {
+        trap_print();
         return 0;
     }
-    if (strcmp(signame, "EXIT") == 0) {
-        trap_set_exit(command);
-        return 0;
+    if (strcmp(cmd->argv[i], "-p") == 0) {
+        /* trap -p SIGNAL...: those signals' traps (POSIX.1-2024) */
+        int status = 0;
+        for (i++; i < cmd->argc; i++) {
+            if (trap_print_one(cmd->argv[i]) != 0) {
+                shell_error("trap: %s: invalid signal specification\n", cmd->argv[i]);
+                status = 1;
+            }
+        }
+        return status;
     }
+    const char *action = cmd->argv[i];
+    if (strcmp(action, "-") == 0) {
+        action = NULL;
+        i++;
+    } else if (isdigit((unsigned char)action[0]) && strspn(action, "0123456789") == strlen(action)) {
+        action = NULL; /* trap N...: reset */
+    } else {
+        i++;
+    }
+    if (i >= cmd->argc) {
+        shell_error("trap: usage: trap [ACTION] SIGNAL...\n");
+        return 2;
+    }
+    int status = 0;
+    for (; i < cmd->argc; i++) {
+        if (trap_set(cmd->argv[i], action) != 0) {
+            shell_error("trap: %s: invalid signal specification\n", cmd->argv[i]);
+            status = 1;
+        }
+    }
+    return status;
+}
 
-    fprintf(stderr, "acsh: trap: %s: unsupported signal name (acsh supports "
-    "only INT and EXIT)\n", signame);
-    return 1;
+/* Option letters `set` accepts, and the long names of `set -o`, in
+ * ash's order. Letters P (pipefail), I, b, E and V are internal: they
+ * have no short form. Behavior lives where each is checked: e, x, P, C
+ * in exec.c; u, f in expand.c; a in vars.c; n, v in main.c. */
+#define SET_OPTIONS "abefnuvxC"
+
+static const struct { const char *name; char letter; } LONG_OPTIONS[] = {
+    { "errexit", 'e' }, { "noglob", 'f' }, { "ignoreeof", 'I' }, { "monitor", 'm' },
+    { "noexec", 'n' }, { "xtrace", 'x' }, { "verbose", 'v' }, { "noclobber", 'C' },
+    { "allexport", 'a' }, { "notify", 'b' }, { "nounset", 'u' }, { "errtrace", 'E' },
+    { "vi", 'V' }, { "pipefail", 'P' }, { NULL, 0 }
+};
+
+/* set -o: "name   on/off"; set +o: commands that recreate the settings. */
+static void list_long_options(int as_commands) {
+    for (int i = 0; LONG_OPTIONS[i].name != NULL; i++) {
+        int on = shell_option(LONG_OPTIONS[i].letter);
+        if (as_commands) {
+            printf("set %co %s\n", on ? '-' : '+', LONG_OPTIONS[i].name);
+        } else {
+            printf("%-15s %s\n", LONG_OPTIONS[i].name, on ? "on" : "off");
+        }
+    }
 }
 
 static int builtin_set(Command *cmd) {
-    if (cmd->argc >= 2 && strcmp(cmd->argv[1], "--") == 0) {
-        int new_argc = cmd->argc - 2;
-        char **new_argv = cmd->argv + 2;
-        if (env_set_positional_params(new_argc, new_argv) != 0) {
-            fprintf(stderr, "acsh: set --: not inside a function (acsh has no "
-            "top-level positional parameters to set)\n");
-            return 1;
-        }
+    if (cmd->argc == 1) {
+        var_print(VARS_ALL); /* bare `set`: every variable */
         return 0;
     }
-
-    /* any other `set` invocation (set -e, set -x, bare `set`, etc.):
-     * accept silently, no effect -- see the scope-limitation note
-     * above this function */
+    int i = 1;
+    for (; i < cmd->argc; i++) {
+        const char *a = cmd->argv[i];
+        if (strcmp(a, "--") == 0) {
+            i++;
+            break;
+        }
+        if ((a[0] != '-' && a[0] != '+') || a[1] == '\0') {
+            break; /* first operand: the new positional parameters */
+        }
+        int on = (a[0] == '-');
+        for (const char *c = a + 1; *c; c++) {
+            if (*c == 'o') {
+                if (i + 1 >= cmd->argc) {
+                    list_long_options(!on);
+                    continue;
+                }
+                const char *name = cmd->argv[++i];
+                int found = 0;
+                for (int k = 0; LONG_OPTIONS[k].name != NULL; k++) {
+                    if (strcmp(LONG_OPTIONS[k].name, name) == 0) {
+                        shell_set_option(LONG_OPTIONS[k].letter, on);
+                        found = 1;
+                    }
+                }
+                if (!found) {
+                    shell_error("set: illegal option -o %s\n", name);
+                    return special_builtin_error();
+                }
+                continue;
+            }
+            if (strchr(SET_OPTIONS, *c) == NULL) {
+                shell_error("set: illegal option %c%c\n", a[0], *c);
+                return special_builtin_error();
+            }
+            shell_set_option(*c, on);
+        }
+    }
+    if (i < cmd->argc || (i > 1 && strcmp(cmd->argv[i - 1], "--") == 0)) {
+        env_set_positional_params(cmd->argc - i, cmd->argv + i);
+    }
     return 0;
 }
 
 static int builtin_local(Command *cmd) {
     if (cmd->argc <= 1) {
-        fprintf(stderr, "acsh: local: usage: local NAME[=value] [NAME[=value] ...]\n");
+        shell_error("local: usage: local NAME[=value] [NAME[=value] ...]\n");
         return 1;
     }
 
@@ -580,19 +845,19 @@ static int builtin_local(Command *cmd) {
             size_t name_len = (size_t)(eq - arg);
             char name[256];
             if (name_len >= sizeof(name)) {
-                fprintf(stderr, "acsh: local: variable name too long\n");
+                shell_error("local: variable name too long\n");
                 status = 1;
                 continue;
             }
             memcpy(name, arg, name_len);
             name[name_len] = '\0';
             if (env_declare_local(name, eq + 1) != 0) {
-                fprintf(stderr, "acsh: local: %s: not inside a function\n", name);
+                shell_error("local: %s: not inside a function\n", name);
                 status = 1;
             }
         } else {
             if (env_declare_local(arg, NULL) != 0) {
-                fprintf(stderr, "acsh: local: %s: not inside a function\n", arg);
+                shell_error("local: %s: not inside a function\n", arg);
                 status = 1;
             }
         }
@@ -606,8 +871,8 @@ static int builtin_shift(Command *cmd) {
         return special_builtin_error();
     }
     if (env_shift_positional_params((int)n) != 0) {
-        fprintf(stderr, "acsh: shift: cannot shift %ld (not enough positional "
-        "parameters, or not inside a function)\n", n);
+        shell_error("shift: can't shift %ld (only %d positional parameters)\n",
+                n, env_positional_count());
         return 1;
     }
     return 0;
@@ -637,85 +902,137 @@ static int builtin_eval(Command *cmd) {
     return status;
 }
 
-/* Reads one line from fd 0 a byte at a time. A shell must not read
- * ahead: stdio buffering would swallow input that belongs to the next
- * `read` or to a command run after this one (e.g. in a
- * `while read l; do ...; done < file` loop). Returns NULL if nothing
- * could be read (end of input); *complete is 0 for a last line that
- * has no newline. */
-static char *read_line_unbuffered(int *complete) {
+/* read [-r] [-p PROMPT] [-t SECS] [-n N] [-s] [-u FD] [-d DELIM] [NAME...]
+ *
+ * Reads one line a byte at a time (never ahead of it: the rest of the
+ * input belongs to whatever runs next). Without -r a backslash keeps
+ * the next character literal and a trailing backslash joins the next
+ * line. The line is split on $IFS: each NAME gets one field, the last
+ * gets the rest. With no NAME the whole line goes to $REPLY. Status 1
+ * at end of input or on timeout (the variables are still set). */
+static int builtin_read(Command *cmd) {
+    int raw = 0, nchars = -1, silent = 0, fd = STDIN_FILENO, i = 1;
+    char delim = '\n';
+    const char *prompt = NULL;
+    double timeout = -1;
+    for (; i < cmd->argc && cmd->argv[i][0] == '-' && cmd->argv[i][1]; i++) {
+        const char *o = cmd->argv[i];
+        if (strcmp(o, "--") == 0) { i++; break; }
+        for (const char *c = o + 1; *c; c++) {
+            if (*c == 'r') { raw = 1; continue; }
+            if (*c == 's') { silent = 1; continue; }
+            if (!strchr("ptnud", *c)) {
+                shell_error("read: illegal option -%c\n", *c);
+                return 2;
+            }
+            const char *arg = c[1] ? c + 1 : (i + 1 < cmd->argc ? cmd->argv[++i] : NULL);
+            if (arg == NULL) {
+                shell_error("read: -%c needs an argument\n", *c);
+                return 2;
+            }
+            if (*c == 'p') prompt = arg;
+            else if (*c == 't') timeout = strtod(arg, NULL);
+            else if (*c == 'n') nchars = atoi(arg);
+            else if (*c == 'u') fd = atoi(arg);
+            else delim = *arg;
+            break;
+        }
+    }
+    if (prompt != NULL && isatty(fd)) {
+        fputs(prompt, stderr);
+    }
+    struct termios saved;
+    int restore_tty = silent && isatty(fd) && tcgetattr(fd, &saved) == 0;
+    if (restore_tty) {
+        struct termios quiet = saved;
+        quiet.c_lflag &= ~(tcflag_t)ECHO;
+        tcsetattr(fd, TCSANOW, &quiet);
+    }
+
+    /* the line, with a flag per character: escaped (not split on) */
     size_t len = 0, cap = 64;
-    char *line = malloc(cap);
-    if (line == NULL) return NULL;
-    *complete = 0;
+    char *line = malloc(cap), *esc = malloc(cap);
+    int status = 1;
     for (;;) {
+        if (nchars >= 0 && (long)len >= nchars) { status = 0; break; }
+        if (timeout >= 0) {
+            struct pollfd pfd = { fd, POLLIN, 0 };
+            int ready = poll(&pfd, 1, (int)(timeout * 1000));
+            if (ready <= 0) break; /* timed out */
+        }
         char c;
-        ssize_t n = read(STDIN_FILENO, &c, 1);
-        if (n < 0 && errno == EINTR) continue;
+        ssize_t n = read(fd, &c, 1);
+        if (n < 0 && errno == EINTR) {
+            if (trap_pending_signal() != 0) break;
+            continue;
+        }
         if (n <= 0) break;
-        if (c == '\n') {
-            *complete = 1;
+        int escaped = 0;
+        if (!raw && c == '\\') {
+            n = read(fd, &c, 1);
+            if (n <= 0) break;
+            if (c == '\n') continue; /* line continuation */
+            escaped = 1;
+        } else if (c == delim) {
+            status = 0;
             break;
         }
         if (len + 2 > cap) {
-            char *bigger = realloc(line, cap *= 2);
-            if (bigger == NULL) { free(line); return NULL; }
-            line = bigger;
+            cap *= 2;
+            line = realloc(line, cap);
+            esc = realloc(esc, cap);
         }
-        line[len++] = c;
+        line[len] = c;
+        esc[len] = (char)escaped;
+        len++;
     }
     line[len] = '\0';
-    if (len == 0 && !*complete) {
-        free(line);
-        return NULL;
+    if (restore_tty) {
+        tcsetattr(fd, TCSANOW, &saved);
+        if (silent) fputc('\n', stderr);
     }
-    return line;
-}
-
-static int builtin_read(Command *cmd) {
-    int complete;
-    char *line = read_line_unbuffered(&complete);
-    if (line == NULL) {
-        return 1; /* EOF */
-    }
-    int status = complete ? 0 : 1; /* a last line without newline: set, but status 1 */
-
-    int nvars = cmd->argc - 1;
-    const char *default_var = "REPLY";
+    int nvars = cmd->argc - i;
     if (nvars == 0) {
-        /* no variable names given: whole line goes into $REPLY */
-        setenv(default_var, line, 1);
+        if (var_set("REPLY", line) != 0) status = 2;
         free(line);
+        free(esc);
         return status;
     }
-
-    char *p = line;
-    for (int i = 0; i < nvars; i++) {
-        while (*p == ' ' || *p == '\t') p++;
-
-        if (i == nvars - 1) {
-            /* last variable gets everything remaining, including any
-             * further whitespace-separated words -- not just one word */
-            setenv(cmd->argv[i + 1], p, 1);
-            break;
+    const char *ifs = var_get("IFS");
+    if (ifs == NULL) ifs = " \t\n";
+#define IS_IFS(k) (!esc[k] && line[k] != '\0' && strchr(ifs, line[k]) != NULL)
+#define IS_WS(k)  (IS_IFS(k) && strchr(" \t\n", line[k]) != NULL)
+    size_t k = 0;
+    while (k < len && IS_WS(k)) k++;                  /* leading IFS whitespace */
+    for (int v = 0; v < nvars; v++) {
+        const char *name = cmd->argv[i + v];
+        size_t start = k, end;
+        if (v == nvars - 1) {
+            end = len;                                /* the last name: the rest */
+            while (end > start && IS_WS(end - 1)) end--;
+        } else {
+            while (k < len && !IS_IFS(k)) k++;
+            end = k;
+            while (k < len && IS_WS(k)) k++;          /* skip one separator */
+            if (k < len && IS_IFS(k) && !IS_WS(k)) {
+                k++;
+                while (k < len && IS_WS(k)) k++;
+            }
         }
-
-        char *word_start = p;
-        while (*p != '\0' && *p != ' ' && *p != '\t') p++;
-        char saved = *p;
-        *p = '\0';
-        setenv(cmd->argv[i + 1], word_start, 1);
-        *p = saved;
-        if (saved != '\0') p++;
+        char *field = strndup(line + start, end - start);
+        if (var_set(name, field) != 0) status = 2;
+        free(field);
     }
-
+#undef IS_IFS
+#undef IS_WS
     free(line);
+    free(esc);
     return status;
 }
 
 static int builtin_source(Command *cmd) {
     if (cmd->argc < 2) {
-        fprintf(stderr, "acsh: source: usage: source FILE\n");
+        shell_error("source: usage: source FILE\n");
         return 1;
     }
     return run_script_file(cmd->argv[1]);
@@ -730,12 +1047,12 @@ static int builtin_return(Command *cmd) {
         return special_builtin_error();
     }
     n &= 0xff;
-    if (env_get_call_depth() == 0) {
+    if (env_get_call_depth() == 0 && !control_flow_in_file()) {
         if (!shell_is_interactive()) {
             trap_run_exit();
             exit((int)n);
         }
-        fprintf(stderr, "acsh: return: not in a function\n");
+        shell_error("return: not in a function\n");
         return 1;
     }
     control_flow_signal_return((int)n);
@@ -746,7 +1063,7 @@ static int builtin_break_or_continue(Command *cmd, int is_continue) {
     if (control_flow_in_loop_depth() <= 0) {
         /* Matches real shells: not inside any loop is a warning, not
          * a hard error -- the shell keeps running normally. */
-        fprintf(stderr, "acsh: %s: only meaningful inside a loop\n",
+        shell_error("%s: only meaningful inside a loop\n",
                 is_continue ? "continue" : "break");
         return 0;
     }
@@ -761,118 +1078,456 @@ static int builtin_break_or_continue(Command *cmd, int is_continue) {
     return 0;
 }
 
+/* ---- small builtins ---- */
+
+static int builtin_colon(Command *cmd) { (void)cmd; return 0; }
+static int builtin_false(Command *cmd) { (void)cmd; return 1; }
+
+/* getopts OPTSTRING NAME [ARG...]: the next option from ARGs (default:
+ * the positional parameters) into NAME, its argument into OPTARG, the
+ * next index into OPTIND. A leading ':' in OPTSTRING selects silent
+ * error reporting. Returns 1 when the options are exhausted. */
+static int builtin_getopts(Command *cmd) {
+    static int pos = 1;          /* position inside a cluster like -abc */
+    static long last_index = 1;  /* OPTIND we last set; any other value restarts */
+    if (cmd->argc < 3) {
+        shell_error("getopts: usage: getopts OPTSTRING NAME [ARG...]\n");
+        return 2;
+    }
+    const char *optstring = cmd->argv[1];
+    const char *name = cmd->argv[2];
+    int silent = (optstring[0] == ':');
+    if (silent) optstring++;
+
+    int argc = cmd->argc > 3 ? cmd->argc - 3 : env_positional_count();
+    const char *optind_s = var_get("OPTIND");
+    long index = optind_s != NULL ? strtol(optind_s, NULL, 10) : 1;
+    if (index < 1) index = 1;
+    if (index != last_index) pos = 1;
+
+#define ARG(i) (cmd->argc > 3 ? cmd->argv[3 + (i) - 1] : env_positional(i))
+    char optbuf[2] = { 0, 0 };
+    int status = 0;
+    if (index > argc || ARG(index)[0] != '-' || ARG(index)[1] == '\0') {
+        var_set(name, "?");
+        var_unset("OPTARG");
+        status = 1;
+    } else if (strcmp(ARG(index), "--") == 0) {
+        index++;
+        var_set(name, "?");
+        var_unset("OPTARG");
+        status = 1;
+    } else {
+        const char *arg = ARG(index);
+        char c = arg[pos++];
+        const char *spec = (c != ':') ? strchr(optstring, c) : NULL;
+        optbuf[0] = c;
+        if (spec == NULL) {
+            if (silent) {
+                var_set(name, "?");
+                var_set("OPTARG", optbuf);
+            } else {
+                fprintf(stderr, "Illegal option -%c\n", c);
+                var_set(name, "?");
+                var_unset("OPTARG");
+            }
+        } else if (spec[1] == ':') {
+            if (arg[pos] != '\0') {
+                var_set("OPTARG", arg + pos);
+                index++;
+                pos = 1;
+            } else if (index < argc) {
+                var_set("OPTARG", ARG(index + 1));
+                index += 2;
+                pos = 1;
+            } else if (silent) {
+                var_set(name, ":");
+                var_set("OPTARG", optbuf);
+                index++;
+                pos = 1;
+                goto done;
+            } else {
+                fprintf(stderr, "No arg for -%c option\n", c);
+                var_set(name, "?");
+                var_unset("OPTARG");
+                index++;
+                pos = 1;
+                goto done;
+            }
+            var_set(name, optbuf);
+        } else {
+            var_set(name, optbuf);
+            var_unset("OPTARG");
+        }
+        if (pos > 1 && arg[pos] == '\0') {
+            index++;
+            pos = 1;
+        }
+    }
+done:
+#undef ARG
+    {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%ld", index);
+        var_set("OPTIND", buf);
+        last_index = index;
+    }
+    return status;
+}
+
+/* Waits for every process of a job; returns the exit code of its last
+ * process and drops the job. A job killed by a signal (other than
+ * SIGINT or SIGPIPE) is reported, as ash does. */
+static int wait_for_job(Job *j) {
+    block_sigchld();
+    for (int k = 0; k < j->num_pids && j->remaining > 0; k++) {
+        int st;
+        pid_t w;
+        do {
+            w = waitpid(j->pids[k], &st, 0);
+            int sig = trap_pending_signal();
+            if (w < 0 && errno == EINTR && sig != 0) {
+                /* a trapped signal arrived: `wait` returns 128+N and
+                 * the trap runs; the job keeps running */
+                unblock_sigchld();
+                return 128 + sig;
+            }
+        } while (w < 0 && errno == EINTR && !shell_interrupted());
+        if (w == j->pids[k]) {
+            jobs_child_exited(w, st);
+        }
+    }
+    int status = j->last_status;
+    jobs_remove(j);
+    unblock_sigchld();
+    if (status > 128 && status - 128 != SIGINT && status - 128 != SIGPIPE) {
+        fprintf(stderr, "%s\n", strsignal(status - 128));
+    }
+    return status;
+}
+
+/* wait [PID | %JOB ...]: no operand waits for every background job. */
+static int builtin_wait(Command *cmd) {
+    if (cmd->argc < 2) {
+        for (int i = 0; i < ACSH_MAX_JOBS; i++) {
+            Job *j = jobs_at(i);
+            if (j != NULL && j->state != JOB_STOPPED) {
+                int st = wait_for_job(j);
+                if (st > 128 && trap_pending_signal() == st - 128) return st;
+            }
+        }
+        return 0;
+    }
+    int status = 0;
+    for (int i = 1; i < cmd->argc; i++) {
+        const char *a = cmd->argv[i];
+        Job *j = NULL;
+        if (a[0] == '%') {
+            j = jobs_resolve(a);
+        } else {
+            long pid;
+            if (parse_number("wait", a, 1, &pid) != 0) return 2;
+            j = jobs_find_by_pid((pid_t)pid);
+        }
+        status = (j != NULL) ? wait_for_job(j) : 127; /* not a child of ours */
+    }
+    return status;
+}
+
+/* kill [-s SIGNAL | -SIGNAL] PID|%JOB...   kill -l [STATUS] */
+static int builtin_kill(Command *cmd) {
+    int i = 1, sig = SIGTERM;
+    if (i < cmd->argc && strcmp(cmd->argv[i], "-l") == 0) {
+        if (i + 1 >= cmd->argc) {
+            signal_list();
+            return 0;
+        }
+        int status = 0;
+        for (i++; i < cmd->argc; i++) {
+            int n = atoi(cmd->argv[i]);
+            const char *name = signal_name(n > 128 ? n - 128 : n);
+            if (name != NULL) printf("%s\n", name);
+            else { shell_error("kill: %s: invalid signal\n", cmd->argv[i]); status = 1; }
+        }
+        return status;
+    }
+    if (i < cmd->argc && (strcmp(cmd->argv[i], "-s") == 0 || strcmp(cmd->argv[i], "-n") == 0)) {
+        if (i + 1 >= cmd->argc || (sig = signal_number(cmd->argv[i + 1])) < 0) {
+            shell_error("kill: bad signal %s\n", i + 1 < cmd->argc ? cmd->argv[i + 1] : "");
+            return 1;
+        }
+        i += 2;
+    } else if (i < cmd->argc && cmd->argv[i][0] == '-' && cmd->argv[i][1] != '\0' &&
+               strcmp(cmd->argv[i], "--") != 0) {
+        if ((sig = signal_number(cmd->argv[i] + 1)) < 0) {
+            shell_error("kill: bad signal %s\n", cmd->argv[i] + 1);
+            return 1;
+        }
+        i++;
+    }
+    if (i < cmd->argc && strcmp(cmd->argv[i], "--") == 0) i++;
+    if (i >= cmd->argc) {
+        shell_error("kill: usage: kill [-s SIGNAL | -SIGNAL] PID|%%JOB...\n");
+        return 1;
+    }
+    int status = 0;
+    for (; i < cmd->argc; i++) {
+        const char *a = cmd->argv[i];
+        pid_t target;
+        if (a[0] == '%') {
+            Job *j = jobs_resolve(a);
+            if (j == NULL) {
+                shell_error("kill: %s: no such job\n", a);
+                status = 1;
+                continue;
+            }
+            if (!j->own_group) {
+                /* started without job control: no process group of its
+                 * own, so signal each of its processes */
+                for (int k = 0; k < j->num_pids; k++) kill(j->pids[k], sig);
+                continue;
+            }
+            target = -j->pgid;
+        } else {
+            char *end;
+            long n = strtol(a, &end, 10);
+            if (*a == '\0' || *end != '\0') {
+                shell_error("kill: %s: invalid pid\n", a);
+                status = 1;
+                continue;
+            }
+            target = (pid_t)n;
+        }
+        if (kill(target, sig) != 0) {
+            shell_error("kill: can't kill pid %s: %s\n", a, strerror(errno));
+            status = 1;
+        }
+    }
+    return status;
+}
+
+/* ulimit [-HS] [-a | -cdefilmnqrstuvx [LIMIT]]: shows or sets resource
+ * limits (default -f), with ash's units and -a layout. */
+static const struct { char opt; int res; int unit; const char *desc; } LIMITS[] = {
+    { 'c', RLIMIT_CORE, 512, "core file size (blocks)" },
+    { 'd', RLIMIT_DATA, 1024, "data seg size (kb)" },
+    { 'e', RLIMIT_NICE, 1, "scheduling priority" },
+    { 'f', RLIMIT_FSIZE, 512, "file size (blocks)" },
+    { 'i', RLIMIT_SIGPENDING, 1, "pending signals" },
+    { 'l', RLIMIT_MEMLOCK, 1024, "max locked memory (kb)" },
+    { 'm', RLIMIT_RSS, 1024, "max memory size (kb)" },
+    { 'n', RLIMIT_NOFILE, 1, "open files" },
+    { 'q', RLIMIT_MSGQUEUE, 1, "POSIX message queues (bytes)" },
+    { 'r', RLIMIT_RTPRIO, 1, "real-time priority" },
+    { 's', RLIMIT_STACK, 1024, "stack size (kb)" },
+    { 't', RLIMIT_CPU, 1, "cpu time (seconds)" },
+    { 'u', RLIMIT_NPROC, 1, "max user processes" },
+    { 'v', RLIMIT_AS, 1024, "virtual memory (kb)" },
+    { 'x', RLIMIT_LOCKS, 1, "file locks" },
+    { 0, 0, 0, NULL }
+};
+
+static void print_limit(rlim_t v, int unit) {
+    if (v == RLIM_INFINITY) printf("unlimited\n");
+    else printf("%llu\n", (unsigned long long)(v / (rlim_t)unit));
+}
+
+static int builtin_ulimit(Command *cmd) {
+    int hard = 0, soft = 0, all = 0;
+    int idx = 3; /* -f, the default */
+    int i = 1;
+    for (; i < cmd->argc && cmd->argv[i][0] == '-' && cmd->argv[i][1]; i++) {
+        for (const char *c = cmd->argv[i] + 1; *c; c++) {
+            if (*c == 'H') hard = 1;
+            else if (*c == 'S') soft = 1;
+            else if (*c == 'a') all = 1;
+            else {
+                int k;
+                for (k = 0; LIMITS[k].opt && LIMITS[k].opt != *c; k++) {}
+                if (!LIMITS[k].opt) {
+                    shell_error("ulimit: illegal option -%c\n", *c);
+                    return 2;
+                }
+                idx = k;
+            }
+        }
+    }
+    if (all) {
+        for (int k = 0; LIMITS[k].opt; k++) {
+            struct rlimit rl;
+            getrlimit(LIMITS[k].res, &rl);
+            printf("%-32s(-%c) ", LIMITS[k].desc, LIMITS[k].opt);
+            print_limit(hard ? rl.rlim_max : rl.rlim_cur, LIMITS[k].unit);
+        }
+        return 0;
+    }
+    struct rlimit rl;
+    if (getrlimit(LIMITS[idx].res, &rl) != 0) {
+        shell_error("ulimit: %s\n", strerror(errno));
+        return 1;
+    }
+    if (i >= cmd->argc) {
+        print_limit(hard ? rl.rlim_max : rl.rlim_cur, LIMITS[idx].unit);
+        return 0;
+    }
+    rlim_t v;
+    if (strcmp(cmd->argv[i], "unlimited") == 0) {
+        v = RLIM_INFINITY;
+    } else {
+        char *end;
+        unsigned long long n = strtoull(cmd->argv[i], &end, 10);
+        if (*cmd->argv[i] == '\0' || *end != '\0') {
+            shell_error("ulimit: bad number %s\n", cmd->argv[i]);
+            return 2;
+        }
+        v = (rlim_t)n * (rlim_t)LIMITS[idx].unit;
+    }
+    if (hard || !soft) rl.rlim_max = v;   /* neither -H nor -S: both */
+    if (soft || !hard) rl.rlim_cur = v;
+    if (setrlimit(LIMITS[idx].res, &rl) != 0) {
+        shell_error("ulimit: %s\n", strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
+/* hash [-r] [NAME...]: remembers where commands are found in $PATH and
+ * lists them; -r forgets them. */
+static char *hashed[64];
+static int nhashed = 0;
+
+static int builtin_hash(Command *cmd) {
+    if (cmd->argc == 1) {
+        for (int i = 0; i < nhashed; i++) printf("%s\n", hashed[i]);
+        return 0;
+    }
+    int status = 0;
+    for (int i = 1; i < cmd->argc; i++) {
+        if (strcmp(cmd->argv[i], "-r") == 0) {
+            for (int k = 0; k < nhashed; k++) free(hashed[k]);
+            nhashed = 0;
+            continue;
+        }
+        if (is_builtin_name(cmd->argv[i]) || function_is_defined(cmd->argv[i])) continue;
+        char *path = find_in_path(cmd->argv[i]);
+        if (path == NULL) {
+            shell_error("hash: %s: not found\n", cmd->argv[i]);
+            status = 1;
+            continue;
+        }
+        int known = 0;
+        for (int k = 0; k < nhashed; k++) if (strcmp(hashed[k], path) == 0) known = 1;
+        if (!known && nhashed < 64) hashed[nhashed++] = path;
+        else free(path);
+    }
+    return status;
+}
+
+/* times: user and system time of the shell, then of its children. */
+static int builtin_times(Command *cmd) {
+    (void)cmd;
+    struct tms t;
+    times(&t);
+    double tick = (double)sysconf(_SC_CLK_TCK);
+    clock_t v[4] = { t.tms_utime, t.tms_stime, t.tms_cutime, t.tms_cstime };
+    for (int i = 0; i < 4; i += 2) {
+        double u = (double)v[i] / tick, s = (double)v[i + 1] / tick;
+        printf("%dm%.3fs %dm%.3fs\n", (int)(u / 60), u - 60 * (int)(u / 60),
+               (int)(s / 60), s - 60 * (int)(s / 60));
+    }
+    return 0;
+}
+
+/* let EXPR...: arithmetic; status 1 if the last value is 0. */
+static int builtin_let(Command *cmd) {
+    if (cmd->argc < 2) {
+        shell_error("let: usage: let EXPRESSION...\n");
+        return 2;
+    }
+    long v = 0;
+    for (int i = 1; i < cmd->argc; i++) {
+        if (arith_evaluate(cmd->argv[i], &v) != 0) return 2;
+    }
+    return v == 0 ? 1 : 0;
+}
+
+/* ---- the builtin table ---- */
+
+static int builtin_break(Command *cmd)    { return builtin_break_or_continue(cmd, 0); }
+static int builtin_continue(Command *cmd) { return builtin_break_or_continue(cmd, 1); }
+static int builtin_history_cmd(Command *cmd) { (void)cmd; return builtin_history(); }
+
+/* Every builtin, once: dispatch, `type`, `command -v` and `hash` all
+ * use this table. */
+static int builtin_help(Command *cmd);
+
+static const struct { const char *name; int (*run)(Command *); } BUILTINS[] = {
+    { ":", builtin_colon }, { ".", builtin_source }, { "[", builtin_test }, { "[[", builtin_test },
+    { "alias", builtin_alias }, { "bg", builtin_bg }, { "break", builtin_break },
+    { "cd", builtin_cd }, { "chdir", builtin_cd }, { "command", builtin_command }, { "continue", builtin_continue },
+    { "echo", builtin_echo }, { "eval", builtin_eval }, { "exec", builtin_exec },
+    { "exit", builtin_exit }, { "export", builtin_export }, { "false", builtin_false },
+    { "fg", builtin_fg }, { "getopts", builtin_getopts }, { "hash", builtin_hash },
+    { "help", builtin_help },
+    { "history", builtin_history_cmd }, { "jobs", builtin_jobs }, { "kill", builtin_kill },
+    { "let", builtin_let }, { "local", builtin_local }, { "printf", builtin_printf },
+    { "pwd", builtin_pwd }, { "read", builtin_read }, { "readonly", builtin_readonly },
+    { "return", builtin_return }, { "set", builtin_set }, { "shift", builtin_shift },
+    { "source", builtin_source }, { "test", builtin_test }, { "times", builtin_times },
+    { "trap", builtin_trap }, { "true", builtin_colon }, { "type", builtin_type },
+    { "ulimit", builtin_ulimit }, { "umask", builtin_umask }, { "unalias", builtin_unalias },
+    { "unset", builtin_unset }, { "wait", builtin_wait },
+    { NULL, NULL }
+};
+
+/* help: the builtin commands, in the layout ash uses. */
+static int builtin_help(Command *cmd) {
+    (void)cmd;
+    printf("Built-in commands:\n------------------\n");
+    int col = 0;
+    for (int i = 0; BUILTINS[i].name != NULL; i++) {
+        int len = (int)strlen(BUILTINS[i].name) + 1;
+        if (col == 0) { putchar('\t'); col = 8; }
+        else if (col + len > 72) { printf("\n\t"); col = 8; }
+        else { putchar(' '); col++; }
+        fputs(BUILTINS[i].name, stdout);
+        col += len - 1;
+    }
+    putchar('\n');
+    return 0;
+}
+
+static int (*find_builtin(const char *name))(Command *) {
+    for (int i = 0; BUILTINS[i].name != NULL; i++) {
+        if (strcmp(BUILTINS[i].name, name) == 0) return BUILTINS[i].run;
+    }
+    return NULL;
+}
+
+int is_builtin_name(const char *name) {
+    return find_builtin(name) != NULL;
+}
+
+/* POSIX special builtins: assignments before them stay set, and their
+ * errors end a non-interactive shell. */
+int is_special_builtin(const char *name) {
+    static const char *names[] = { "break", ":", "continue", ".", "eval", "exec", "exit",
+                                   "export", "readonly", "return", "set", "shift", "times",
+                                   "trap", "unset", NULL };
+    for (int i = 0; names[i] != NULL; i++) {
+        if (strcmp(name, names[i]) == 0) return 1;
+    }
+    return 0;
+}
+
 int try_run_builtin(Command *cmd, int *exit_status) {
     if (cmd->argc == 0 || cmd->argv[0] == NULL) {
         return 0;
     }
-
-    if (strcmp(cmd->argv[0], "break") == 0) {
-        *exit_status = builtin_break_or_continue(cmd, /*is_continue=*/0);
-        return 1;
-    }
-    if (strcmp(cmd->argv[0], "continue") == 0) {
-        *exit_status = builtin_break_or_continue(cmd, /*is_continue=*/1);
-        return 1;
-    }
-    if (strcmp(cmd->argv[0], "return") == 0) {
-        *exit_status = builtin_return(cmd);
-        return 1;
-    }
-
-    if (strcmp(cmd->argv[0], "test") == 0 || strcmp(cmd->argv[0], "[") == 0 ||
-        strcmp(cmd->argv[0], "[[") == 0) {
-        *exit_status = builtin_test(cmd);
-    return 1;
-        }
-
-        if (strcmp(cmd->argv[0], "cd") == 0) {
-            *exit_status = builtin_cd(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "exit") == 0) {
-            *exit_status = builtin_exit(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "pwd") == 0) {
-            *exit_status = builtin_pwd();
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "jobs") == 0) {
-            *exit_status = builtin_jobs();
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "fg") == 0) {
-            *exit_status = builtin_fg(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "bg") == 0) {
-            *exit_status = builtin_bg(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "export") == 0) {
-            *exit_status = builtin_export(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "unset") == 0) {
-            *exit_status = builtin_unset(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "alias") == 0) {
-            *exit_status = builtin_alias(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "unalias") == 0) {
-            *exit_status = builtin_unalias(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "history") == 0) {
-            *exit_status = builtin_history();
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "source") == 0 || strcmp(cmd->argv[0], ".") == 0) {
-            *exit_status = builtin_source(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "read") == 0) {
-            *exit_status = builtin_read(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "exec") == 0) {
-            *exit_status = builtin_exec(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "umask") == 0) {
-            *exit_status = builtin_umask(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "type") == 0) {
-            *exit_status = builtin_type(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "command") == 0) {
-            *exit_status = builtin_command(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "shift") == 0) {
-            *exit_status = builtin_shift(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "local") == 0) {
-            *exit_status = builtin_local(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "set") == 0) {
-            *exit_status = builtin_set(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "eval") == 0) {
-            *exit_status = builtin_eval(cmd);
-            return 1;
-        }
-        if (strcmp(cmd->argv[0], "trap") == 0) {
-            *exit_status = builtin_trap(cmd);
-            return 1;
-        }
-
+    int (*run)(Command *) = find_builtin(cmd->argv[0]);
+    if (run == NULL) {
         return 0;
+    }
+    *exit_status = run(cmd);
+    return 1;
 }

@@ -13,7 +13,7 @@ static int   history_start = 0;   /* index of the oldest entry (ring buffer) */
 /* Builds the full path to ~/.acsh_history into `out`. Returns 0 on
  * success, -1 if HOME isn't set (history is simply skipped then). */
 static int history_file_path(char *out, size_t outsize) {
-    const char *home = getenv("HOME");
+    const char *home = var_get("HOME");
     if (home == NULL) {
         return -1;
     }

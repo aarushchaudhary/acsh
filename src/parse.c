@@ -79,7 +79,7 @@ static int at_list_end(Parser *p) {
     Token *t = peek(p);
     if (p->failed) return 1;
     switch (t->type) {
-    case T_RPAREN: case T_DSEMI: case T_EOF:
+    case T_RPAREN: case T_DSEMI: case T_SEMIAND: case T_EOF:
         return 1;
     case T_WORD:
         return is_kw(t, "then") || is_kw(t, "else") || is_kw(t, "elif") || is_kw(t, "fi") ||
@@ -107,6 +107,7 @@ static const char *describe(Token *t) {
     case T_AND_IF:    return "&&";
     case T_OR_IF:     return "||";
     case T_DSEMI:     return ";;";
+    case T_SEMIAND:   return ";&";
     case T_LPAREN:    return "(";
     case T_RPAREN:    return ")";
     case T_LESS:      return "<";
@@ -118,6 +119,8 @@ static const char *describe(Token *t) {
     case T_CLOBBER:   return ">|";
     case T_DLESS:     return "<<";
     case T_DLESSDASH: return "<<-";
+    case T_ANDGREAT:  return "&>";
+    case T_ANDDGREAT: return "&>>";
     }
     return "?";
 }
@@ -161,7 +164,7 @@ static int expect_kw(Parser *p, const char *kw, const char *msg, const char *usa
 static Node *node_new(NodeKind kind) {
     Node *n = calloc(1, sizeof(Node));
     if (n == NULL) {
-        fprintf(stderr, "acsh: out of memory\n");
+        shell_error("out of memory\n");
         exit(2);
     }
     n->kind = kind;
@@ -179,7 +182,7 @@ static Node *node_bin(NodeKind kind, Node *left, Node *right) {
 static void push_str(char ***arr, int *n, char *s) {
     char **bigger = realloc(*arr, (size_t)(*n + 1) * sizeof(char *));
     if (bigger == NULL) {
-        fprintf(stderr, "acsh: out of memory\n");
+        shell_error("out of memory\n");
         exit(2);
     }
     *arr = bigger;
@@ -288,6 +291,7 @@ static int is_redirect_start(Token *t) {
     switch (t->type) {
     case T_IO_NUMBER: case T_LESS: case T_GREAT: case T_DGREAT: case T_LESSAND:
     case T_GREATAND: case T_LESSGREAT: case T_CLOBBER: case T_DLESS: case T_DLESSDASH:
+    case T_ANDGREAT: case T_ANDDGREAT:
         return 1;
     default:
         return 0;
@@ -312,14 +316,15 @@ static int parse_redirect(Parser *p, Redir **list) {
     switch (op.type) {
     case T_LESS:      kind = R_IN;     default_fd = 0; break;
     case T_GREAT:     kind = R_OUT;    default_fd = 1; break;
-    case T_CLOBBER:   kind = R_OUT;    default_fd = 1; break;
+    case T_CLOBBER:   kind = R_CLOBBER; default_fd = 1; break;
     case T_DGREAT:    kind = R_APPEND; default_fd = 1; break;
     case T_LESSGREAT: kind = R_RDWR;   default_fd = 0; break;
     case T_LESSAND:   kind = R_DUP;    default_fd = 0; break;
     case T_GREATAND:  kind = R_DUP;    default_fd = 1; break;
-    case T_DLESS: case T_DLESSDASH:
-        fail(p, NULL, "here-documents (<<) are not supported yet");
-        return -1;
+    case T_DLESS:     kind = R_HEREDOC; default_fd = 0; break;
+    case T_DLESSDASH: kind = R_HEREDOC; default_fd = 0; break;
+    case T_ANDGREAT:  kind = R_OUT;    default_fd = 1; break;
+    case T_ANDDGREAT: kind = R_APPEND; default_fd = 1; break;
     default:
         fail_unexpected(p);
         return -1;
@@ -331,12 +336,44 @@ static int parse_redirect(Parser *p, Redir **list) {
     Token target = take(p);
     Redir *r = calloc(1, sizeof(Redir));
     if (r == NULL) {
-        fprintf(stderr, "acsh: out of memory\n");
+        shell_error("out of memory\n");
         exit(2);
     }
     r->fd = (fd >= 0) ? fd : default_fd;
     r->kind = kind;
-    r->target = target.text;
+    if (kind == R_HEREDOC) {
+        /* the delimiter is the word with its quotes removed; any quoting
+         * makes the body literal. The body is read at the end of the line. */
+        char *delim = target.text;
+        char *o = delim;
+        for (char *c = delim; *c; c++) {
+            if (*c != SQ_START && *c != SQ_END && *c != DQ_START && *c != DQ_END) *o++ = *c;
+        }
+        *o = '\0';
+        r->target = strdup("");
+        lex_add_heredoc(p->lx, r, delim, target.quoted, op.type == T_DLESSDASH);
+        free(delim);
+    } else {
+        r->target = target.text;
+    }
+    if (op.type == T_ANDGREAT || op.type == T_ANDDGREAT) {
+        /* &>word and &>>word: stdout to word, then 2>&1 */
+        if (fd >= 0) {
+            free(r->target);
+            free(r);
+            fail(p, NULL, "a file descriptor number cannot come before '&>'");
+            return -1;
+        }
+        Redir *dup = calloc(1, sizeof(Redir));
+        if (dup == NULL) {
+            shell_error("out of memory\n");
+            exit(2);
+        }
+        dup->fd = 2;
+        dup->kind = R_DUP;
+        dup->target = strdup("1");
+        r->next = dup;
+    }
     while (*list != NULL) list = &(*list)->next; /* keep source order */
     *list = r;
     return 0;
@@ -356,6 +393,45 @@ static void add_word(Node *n, char *w) {
     }
 }
 
+/* [[ ... ]]: between the brackets, && || ( ) < > are words for the
+ * test builtin, not shell operators. */
+static Node *parse_dbracket(Parser *p, char *open) {
+    Node *n = node_new(N_SIMPLE);
+    add_word(n, open);
+    for (;;) {
+        Token *t = peek(p);
+        if (p->failed) break;
+        const char *op = NULL;
+        switch (t->type) {
+        case T_AND_IF: op = "&&"; break;
+        case T_OR_IF:  op = "||"; break;
+        case T_LPAREN: op = "(";  break;
+        case T_RPAREN: op = ")";  break;
+        case T_LESS:   op = "<";  break;
+        case T_GREAT:  op = ">";  break;
+        case T_WORD: {
+            Token w = take(p);
+            int end = !w.quoted && strcmp(w.text, "]]") == 0;
+            add_word(n, w.text);
+            if (end) {
+                parse_redirects(p, n);
+                if (p->failed) { node_unref(n); return NULL; }
+                return n;
+            }
+            continue;
+        }
+        default:
+            fail(p, "[[ EXPRESSION ]]", "expected ']]' to close '[['");
+            node_unref(n);
+            return NULL;
+        }
+        drop(p);
+        add_word(n, strdup(op));
+    }
+    node_unref(n);
+    return NULL;
+}
+
 static Node *parse_simple(Parser *p, char *first_word) {
     Node *n = node_new(N_SIMPLE);
     if (first_word != NULL) {
@@ -363,6 +439,16 @@ static Node *parse_simple(Parser *p, char *first_word) {
     }
     while (!p->failed) {
         Token *t = peek(p);
+        if (p->lx->alias_blank && t->start >= p->lx->alias_end) {
+            /* POSIX: after an alias whose value ends in a blank, the
+             * next word is also checked for an alias */
+            p->lx->alias_blank = 0;
+            if (t->type == T_WORD && lex_expand_alias(p->lx, t)) {
+                free(t->text);
+                p->have = 0;
+                continue;
+            }
+        }
         if (is_redirect_start(t)) {
             if (parse_redirect(p, &n->redirs) != 0) break;
         } else if (t->type == T_WORD) {
@@ -498,7 +584,7 @@ static Node *parse_case(Parser *p) {
         }
         CaseItem *item = calloc(1, sizeof(CaseItem));
         if (item == NULL) {
-            fprintf(stderr, "acsh: out of memory\n");
+            shell_error("out of memory\n");
             exit(2);
         }
         *tail = item;
@@ -523,11 +609,12 @@ static Node *parse_case(Parser *p) {
         drop(p);
         item->body = parse_list(p, 0);
         if (p->failed) break;
-        if (peek(p)->type == T_DSEMI) {
+        if (peek(p)->type == T_DSEMI || peek(p)->type == T_SEMIAND) {
+            item->fallthrough = (peek(p)->type == T_SEMIAND); /* POSIX.1-2024 */
             drop(p);
             skip_newlines(p);
         } else if (!is_kw(peek(p), "esac")) {
-            fail(p, CASE_USAGE, "expected ';;' or 'esac' after the case clause");
+            fail(p, CASE_USAGE, "expected ';;', ';&' or 'esac' after the case clause");
         }
     }
     return n;
@@ -572,13 +659,16 @@ static Node *parse_compound(Parser *p) {
     return n;
 }
 
-static Node *parse_funcdef(Parser *p, char *name) {
-    drop(p); /* ( */
-    if (peek(p)->type != T_RPAREN) {
-        free(name);
-        return fail(p, NULL, "expected ')' after '(' in the function definition");
+/* NAME() BODY, or with `keyword` (after `function`): NAME [()] BODY. */
+static Node *parse_funcdef(Parser *p, char *name, int keyword) {
+    if (!keyword || peek(p)->type == T_LPAREN) {
+        drop(p); /* ( */
+        if (peek(p)->type != T_RPAREN) {
+            free(name);
+            return fail(p, NULL, "expected ')' after '(' in the function definition");
+        }
+        drop(p);
     }
-    drop(p);
     skip_newlines(p);
     Node *body = p->failed ? NULL : parse_compound(p);
     if (body == NULL) {
@@ -593,7 +683,18 @@ static Node *parse_funcdef(Parser *p, char *name) {
     return n;
 }
 
+static Node *parse_command_at(Parser *p);
+
 static Node *parse_command(Parser *p) {
+    size_t start = peek(p)->start;
+    Node *n = parse_command_at(p);
+    if (n != NULL) {
+        n->lineno = lex_line_at(p->lx, start);
+    }
+    return n;
+}
+
+static Node *parse_command_at(Parser *p) {
     for (;;) {
         Token *t = peek(p);
         if (p->failed) return NULL;
@@ -616,8 +717,21 @@ static Node *parse_command(Parser *p) {
     }
     if (t->type == T_WORD) {
         Token w = take(p);
+        if (!w.quoted && strcmp(w.text, "[[") == 0) {
+            return parse_dbracket(p, w.text);
+        }
         if (!w.quoted && is_name(w.text) && peek(p)->type == T_LPAREN) {
-            return parse_funcdef(p, w.text);
+            return parse_funcdef(p, w.text, 0);
+        }
+        if (!w.quoted && strcmp(w.text, "function") == 0 && peek(p)->type == T_WORD) {
+            /* function NAME [()] BODY, as in ash, bash and ksh */
+            Token name = take(p);
+            free(w.text);
+            if (name.quoted || !is_name(name.text)) {
+                free(name.text);
+                return fail(p, "function NAME { COMMANDS; }", "expected a function name after 'function'");
+            }
+            return parse_funcdef(p, name.text, 1);
         }
         return parse_simple(p, w.text);
     }
@@ -641,7 +755,7 @@ static Node *parse_pipeline(Parser *p) {
         }
         Node **bigger = realloc(n->u.pipe.cmds, (size_t)(n->u.pipe.ncmds + 1) * sizeof(Node *));
         if (bigger == NULL) {
-            fprintf(stderr, "acsh: out of memory\n");
+            shell_error("out of memory\n");
             exit(2);
         }
         n->u.pipe.cmds = bigger;
@@ -688,10 +802,11 @@ static Node *parse_list(Parser *p, int top) {
         TokType t = peek(p)->type;
         int separated = 1;
         if (t == T_AMP) {
+            size_t end = p->last_end;  /* the job's text, without the & (as ash shows it) */
             drop(p);
             Node *bg = node_new(N_BACKGROUND);
             bg->u.sub.body = item;
-            bg->text = lex_source(p->lx, start, p->last_end);
+            bg->text = lex_source(p->lx, start, end);
             item = bg;
         } else if (t == T_SEMI) {
             drop(p);

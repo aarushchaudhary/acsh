@@ -1,0 +1,3 @@
+echo before
+echo $((1/0))
+echo not-reached
