@@ -54,7 +54,7 @@ musl as is; on a glibc system install musl-tools and run
 
 | Suite | What it checks |
 |---|---|
-| `tests/run_diff.sh` | Runs each of the 47 scripts in `tests/diff/` under acsh **and** under BusyBox `ash`, and requires identical stdout and exit status. |
+| `tests/run_diff.sh` | Runs each of the 50 scripts in `tests/diff/` under acsh **and** under BusyBox `ash`, and requires identical stdout and exit status. |
 | `./acsh test_acsh.sh` | 130 checks, mostly of features that `ash` does not share (so they cannot be diffed), plus interactive behaviour through `-i`. |
 | `tests/pty/pty_test` | A C program that runs acsh on a pseudo-terminal and types keys: startup files (including `/etc/acshrc` and `su`, as root in CI), prompts, the line editor, completion and suggestions (46 checks). |
 | `tests/realworld/run.sh` | Real scripts under acsh and `ash`, compared: the system's `/etc/profile`, every init script in `/etc/init.d` (OpenRC's sourced, with `depend()` run), abuild and its `functions.sh`, and `./configure` of an autotools project generated on the spot. |
@@ -154,6 +154,22 @@ fix. On the full release build, 260 checks passed and none failed; the
 | 3.8 | completion covers only commands and files | 9 |
 | 3.9 | history suggestions | 4 |
 | 3.10 | `ash` is valued for being small | 1 (on the `MINIMAL=1` build, which passes 225 checks) |
+
+### Found by running real scripts
+
+Running Alpine's OpenRC scripts, abuild and autoconf `configure` scripts
+under acsh (`tests/realworld/`, and libltdl's full `configure`: 121
+checks, the same `config.h` as under `ash`) found five bugs that the
+unit tests had missed. Each now has a test in `tests/diff/`
+(`command_v`, `openrc_style`, `status_exit_exec`, `traps`):
+
+| Found | Before | Now |
+|---|---|---|
+| `command -v f` for a function (how init scripts test for `depend`) | not found | prints `f`, as `ash` |
+| `exec prog` after `export X=1` | `prog` got the environment acsh started with; `configure` re-ran itself forever | `prog` gets the shell's exported variables |
+| `false; rc=$?` | `rc` was 0 | 1 |
+| `exit 1` with `trap '... exit' 0` | the trap saw `$?=0`; the shell exited 0 | `$?` is 1 in the trap; a bare `exit` there keeps 1 |
+| a trapped signal arriving as a background job ends, during `wait` | `wait` sometimes returned 0 | always 128+N, as `ash` |
 
 ### The final code audit
 

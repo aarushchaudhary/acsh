@@ -16,6 +16,7 @@ ACSH=${1:-./acsh}
 ACSH=$(cd "$(dirname "$ACSH")" && pwd)/$(basename "$ACSH")
 ASH=${ASH:-busybox ash}
 work=$(mktemp -d)
+export work   # the compared commands run in a fresh sh (under timeout)
 trap 'rm -rf "$work"' EXIT
 pass=0; fail=0; skip=0
 
@@ -30,15 +31,19 @@ result() { # result NAME: compares $work/a.out with $work/b.out
 skipped() { skip=$((skip + 1)); echo "SKIP:  $1 ($2)"; }
 
 # both NAME CMD...: runs CMD under each shell (the shell is $SH), keeps
-# stdout and the exit status
+# stdout and the exit status. Each run gets LIMIT seconds (default 300):
+# a shell that hangs shows up as exit=124 instead of stalling the job.
+LIMIT=${LIMIT:-300}
 both() {
     name=$1; shift
-    SH=$ASH;  export SH; (eval "$*") >"$work/a.out" 2>/dev/null; echo "exit=$?" >>"$work/a.out"
-    SH=$ACSH; export SH; (eval "$*") >"$work/b.out" 2>/dev/null; echo "exit=$?" >>"$work/b.out"
+    SH=$ASH;  export SH; timeout "$LIMIT" sh -c "$*" </dev/null >"$work/a.out" 2>/dev/null; echo "exit=$?" >>"$work/a.out"
+    SH=$ACSH; export SH; timeout "$LIMIT" sh -c "$*" </dev/null >"$work/b.out" 2>/dev/null; echo "exit=$?" >>"$work/b.out"
     result "$name"
 }
 
 echo "[profile]"
+# PS1 is left out: Alpine's profile gives busybox ash an escape-based
+# prompt and every other shell a ${HOSTNAME%%.*}:$PWD one, by design.
 # A busybox ash built to prefer its own applets (Ubuntu's) runs its
 # built-in run-parts, ls and so on instead of the system's: the profile
 # then takes other paths in ash, and comparing would mean nothing.
@@ -49,7 +54,6 @@ elif [ -r /etc/profile ]; then
     both "/etc/profile in a login shell: status, no errors, the environment it sets" \
         'HOME=$work/home env -i HOME=$work/home PATH=/usr/sbin:/usr/bin:/sbin:/bin TERM=dumb $SH -l -c '"'"'
             echo "PATH=$PATH"; echo "LANG=$LANG"; echo "CHARSET=$CHARSET"; echo "PAGER=$PAGER"
-            case $PS1 in "" | "\$ ") ;; *) echo "PS1=$PS1" ;; esac   # only a PS1 the profile set
             echo "umask=$(umask)"'"'"' 2>&1 | grep -v "^ash:\|^acsh:" ; true'
     both "/etc/profile writes nothing to stderr" \
         'env -i HOME=$work/home PATH=/usr/sbin:/usr/bin:/sbin:/bin TERM=dumb $SH -l -c : 2>&1 >/dev/null | wc -c'
@@ -80,6 +84,7 @@ done
 
 echo "[abuild]"
 FUNCS=/usr/share/abuild/functions.sh
+export FUNCS
 if [ -r "$FUNCS" ] && command -v abuild >/dev/null 2>&1; then
     both "sh -n $(command -v abuild)" '$SH -n "$(command -v abuild)"'
     both "abuild -h" '$SH "$(command -v abuild)" -h 2>&1 | sed "s/^[a-z]*sh: //"'

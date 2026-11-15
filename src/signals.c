@@ -199,12 +199,32 @@ int trap_pending_signal(void) {
     return 0;
 }
 
+/* While a trap action runs: the status from just before it. POSIX: a
+ * bare `exit` in a trap action exits with that status, not with the
+ * status of the trap's own last command (autoconf's EXIT trap ends in
+ * `exit $exit_status` with exit_status empty). */
+static int in_trap = 0;
+static int status_before_trap = 0;
+
+int trap_exit_status(int fallback) {
+    return in_trap ? status_before_trap : fallback;
+}
+
+static void run_in_trap(const char *cmd) {
+    int saved = env_get_last_status();
+    int outer_in = in_trap, outer_status = status_before_trap;
+    in_trap = 1;
+    status_before_trap = saved;
+    run_string(cmd);
+    in_trap = outer_in;
+    status_before_trap = outer_status;
+    env_set_last_status(saved);  /* a trap does not change $? */
+}
+
 static void run_trap_command(const char *cmd) {
     char *copy = strdup(cmd);   /* the trap may reset itself */
-    int saved = env_get_last_status();
-    if (copy != NULL) run_string(copy);
+    if (copy != NULL) run_in_trap(copy);
     free(copy);
-    env_set_last_status(saved); /* a trap does not change $? */
 }
 
 int trap_run_pending(void) {
@@ -224,12 +244,15 @@ int trap_run_pending(void) {
     return ran;
 }
 
+/* The EXIT trap. It sees the exit status in $? and the shell still
+ * exits with that status afterwards, unless the trap itself calls exit
+ * (configure's trap 'exit_status=$?; ...; exit $exit_status' 0). */
 void trap_run_exit(void) {
     if (exit_trap != NULL) {
         /* cleared first, so an `exit` inside the trap cannot run it again */
         char *cmd = exit_trap;
         exit_trap = NULL;
-        run_string(cmd);
+        run_in_trap(cmd);
         free(cmd);
     }
 }

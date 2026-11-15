@@ -21,6 +21,14 @@
  * parent shell. fork() gives that isolation for free, and it also
  * lets us capture stdout simply by pointing the child's fd 1 at a
  * pipe -- no need to redirect anything inside the parent. */
+/* How many command substitutions have run: an assignment-only command
+ * takes the status of the last one it ran, or 0 if it ran none. */
+static unsigned long substitutions_run = 0;
+
+unsigned long command_subst_count(void) {
+    return substitutions_run;
+}
+
 /* How many $(...) / <(...) enclose this process: a forked child
  * inherits it, so the count spans the chain of subshells. */
 static int subst_depth = 0;
@@ -32,6 +40,7 @@ static int subst_too_deep(void) {
 }
 
 char *command_substitute(const char *cmd) {
+    substitutions_run++;
 #ifdef ACSH_FUZZ
     (void)cmd;                 /* fuzzing expansion must not run commands */
     return strdup("");

@@ -185,7 +185,7 @@ static int special_builtin_error(void) {
 }
 
 static int builtin_exit(Command *cmd) {
-    long code = env_get_last_status();
+    long code = trap_exit_status(env_get_last_status());  /* bare exit in a trap: see signals.c */
     if (cmd->argc > 1 && parse_number("exit", cmd->argv[1], 0, &code) != 0) {
         return special_builtin_error();
     }
@@ -193,7 +193,9 @@ static int builtin_exit(Command *cmd) {
      * jumps straight out of the process and never returns to
      * main()'s own loop, so main() calling trap_run_exit() after its
      * loop ends only covers the EOF/Ctrl+D path, not this one. Both
-     * paths out of the shell must honor an EXIT trap. */
+     * paths out of the shell must honor an EXIT trap, and the trap
+     * sees the status being exited with in $?. */
+    env_set_last_status((int)(code & 0xff));
     trap_run_exit();
     exit((int)(code & 0xff));
     return 0; /* unreachable */
@@ -613,18 +615,32 @@ static int builtin_command_run(Command *cmd) {
             shell_error("command: -v: usage: command -v NAME\n");
             return 1;
         }
-        const char *name = cmd->argv[2];
-        if (is_builtin_name(name)) {
-            printf("%s\n", name);
-            return 0;
+        /* command -v NAME: how NAME would run, as ash prints it:
+         * an alias as alias NAME='value', a reserved word, function or
+         * builtin as its name, a program as its path. 127 if one is not
+         * found (and nothing is printed for it). */
+        static const char *reserved[] = { "if", "then", "else", "elif", "fi", "do", "done", "case",
+                                          "esac", "while", "until", "for", "in", "{", "}", "!",
+                                          "[[", "]]", "function", NULL };
+        int status = 0;
+        for (int i = 2; i < 3; i++) {   /* ash looks at the first name only */
+            const char *name = cmd->argv[i];
+            const char *alias = alias_get(name);
+            int word = 0;
+            for (int k = 0; reserved[k]; k++) if (strcmp(reserved[k], name) == 0) word = 1;
+            if (alias != NULL) {
+                fputs("alias ", stdout);
+                alias_print(name, alias);
+            } else if (word || function_is_defined(name) || is_builtin_name(name)) {
+                printf("%s\n", name);
+            } else {
+                char *path = find_in_path(name);
+                if (path != NULL) printf("%s\n", path);
+                else status = 127;
+                free(path);
+            }
         }
-        char *path = find_in_path(name);
-        if (path != NULL) {
-            printf("%s\n", path);
-            free(path);
-            return 0;
-        }
-        return 1; /* not found: command -v is silent on failure by convention */
+        return status;
     }
 
     /* plain `command NAME ARGS...`: build a Command skipping
@@ -653,7 +669,12 @@ static int builtin_exec(Command *cmd) {
         return 0; /* bare `exec`: no-op, see note above */
     }
 
-    /* argv[1..] becomes the new process's argv[0..] */
+    /* argv[1..] becomes the new process's argv[0..]; its environment is
+     * the shell's exported variables now, not the one acsh started with
+     * (configure exports _as_can_reexec and re-execs itself this way) */
+    extern char **environ;
+    char **env = var_environ();
+    if (env != NULL) environ = env;
     execvp(cmd->argv[1], cmd->argv + 1);
 
     /* only reached if execvp failed */
@@ -1192,13 +1213,21 @@ static int wait_for_job(Job *j) {
 }
 
 /* wait [PID | %JOB ...]: no operand waits for every background job. */
+/* POSIX: a trapped signal that arrives while wait waits makes it
+ * return 128+N, even when the job finished in the same instant (the
+ * kernel runs the handler before waitpid() returns to us), as ash does. */
+static int trap_during_wait(int status) {
+    int sig = trap_pending_signal();
+    return sig != 0 ? 128 + sig : status;
+}
+
 static int builtin_wait(Command *cmd) {
     if (cmd->argc < 2) {
         for (int i = 0; i < jobs_capacity(); i++) {
             Job *j = jobs_at(i);
             if (j != NULL && j->state != JOB_STOPPED) {
                 int st = wait_for_job(j);
-                if (st > 128 && trap_pending_signal() == st - 128) return st;
+                if (trap_pending_signal() != 0) return trap_during_wait(st);
             }
         }
         return 0;
@@ -1215,6 +1244,7 @@ static int builtin_wait(Command *cmd) {
             j = jobs_find_by_pid((pid_t)pid);
         }
         status = (j != NULL) ? wait_for_job(j) : 127; /* not a child of ours */
+        if (trap_pending_signal() != 0) return trap_during_wait(status);
     }
     return status;
 }

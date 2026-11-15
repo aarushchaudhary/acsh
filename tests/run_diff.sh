@@ -28,7 +28,8 @@ run_one() { # shell-command test-file output-file
     rm -rf "$work/cwd" && mkdir "$work/cwd"
     limit=$(sed -n 's/^# timeout: *\([0-9][0-9]*\).*/\1/p' "$2" | head -1)
     args=$(sed -n 's/^# args: *//p' "$2" | head -1)
-    (cd "$work/cwd" && timeout "${limit:-$TIMEOUT}" $1 "$2" $args </dev/null >"$3" 2>/dev/null; echo "exit=$?" >>"$3")
+    # SHELL_UNDER_TEST: for tests that start the same shell again
+    (cd "$work/cwd" && SHELL_UNDER_TEST=$1 timeout "${limit:-$TIMEOUT}" $1 "$2" $args </dev/null >"$3" 2>/dev/null; echo "exit=$?" >>"$3")
 }
 
 for t in "$here"/diff/*.sh; do

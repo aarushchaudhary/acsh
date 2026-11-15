@@ -14,7 +14,7 @@ jobs:
       - name: Install build and comparison tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential busybox autoconf
+          sudo apt-get install -y build-essential busybox autoconf automake
 
       - name: Build
         run: make
@@ -156,11 +156,12 @@ jobs:
           strip busybox
           cp busybox ../ash-static
           cd ..
-          ./ash-static ash -c 'echo standalone ash works: $((6*7))'
+          # an ash-only busybox has no "busybox" applet: it runs as ash
+          ln -sf ash-static ash
+          ./ash -c 'echo standalone ash works: $((6*7))'
 
       - name: Size, idle memory and 1,000 runs of -c true (gate checked)
         run: |
-          ln -s "$PWD/ash-static" ./ash
           CHECK=1 tests/bench/bench.sh "ash=./ash" "acsh-min=./acsh-min-static" "acsh=./acsh-full-static"
 
   alpine:
@@ -171,7 +172,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build tools
-        run: apk add --no-cache build-base busybox openrc abuild autoconf
+        run: apk add --no-cache build-base busybox openrc abuild autoconf automake
 
       - name: Build (dynamic and static)
         run: |

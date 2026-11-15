@@ -755,12 +755,14 @@ static int run_simple(Node *n, int in_child, const char *text) {
 
     if (n->u.simple.nwords == 0) {
         /* assignments and/or redirections only: the status is that of
-         * the last command substitution, or 0 */
-        env_set_last_status(0);
+         * the last command substitution, or 0. $? keeps its old value
+         * while the values expand, so rc=$? works. */
+        unsigned long substs = command_subst_count();
         for (int i = 0; i < n->u.simple.nassigns; i++) {
             if (set_assignment(n->u.simple.assigns[i]) != 0) return expansion_failed();
         }
-        status = env_get_last_status();
+        status = (command_subst_count() != substs) ? env_get_last_status() : 0;
+        env_set_last_status(status);
         trace(n->u.simple.assigns, n->u.simple.nassigns, 1, NULL, 0);
         FdSave save;
         if (apply_redirs(n->redirs, in_child ? NULL : &save) != 0) {
@@ -771,6 +773,7 @@ static int run_simple(Node *n, int in_child, const char *text) {
         return status;
     }
 
+    unsigned long substs = command_subst_count();
     if (expand_args(n->u.simple.words, n->u.simple.nwords, &args) != 0) {
         args_free(&args);
         return expansion_failed();
@@ -781,7 +784,7 @@ static int run_simple(Node *n, int in_child, const char *text) {
             if (set_assignment(n->u.simple.assigns[i]) != 0) return expansion_failed();
         }
         args_free(&args);
-        return env_get_last_status();
+        return (command_subst_count() != substs) ? env_get_last_status() : 0;
     }
 
     const char *name = args.v[0];
@@ -806,6 +809,13 @@ static int run_simple(Node *n, int in_child, const char *text) {
                 free(saved);
                 args_free(&args);
                 return expansion_failed();
+            }
+            if (keep && strcmp(name, "exec") == 0) {
+                /* VAR=x exec prog: prog gets VAR in its environment (as ash, bash) */
+                const char *a = n->u.simple.assigns[i];
+                char *nm = strndup(a, (size_t)(strchr(a, '=') - a));
+                if (nm != NULL) var_add_flags(nm, V_EXPORT);
+                free(nm);
             }
         }
         trace(n->u.simple.assigns, n->u.simple.nassigns, 1, args.v, args.n);

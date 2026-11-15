@@ -198,6 +198,7 @@ void trap_reset_for_subshell(void);
 void signal_lock_ignored(int sig); /* ignore sig for good (POSIX entry-ignored rule) */
 void signal_default(int sig);      /* SIG_DFL, or SIG_IGN if locked ignored */
 void trap_print(void);            /* trap -- 'cmd' NAME ... */
+int  trap_exit_status(int fallback); /* status for a bare exit: the pre-trap one inside a trap */
 int  trap_print_one(const char *spec); /* trap -p SIG; -1: no such signal */
 
 /* Ctrl+C: with no INT trap, SIGINT that reaches the shell (or kills the
@@ -304,6 +305,7 @@ int arith_evaluate(const char *expr, long *result);
  * Runs cmd in a forked subshell and returns its output (heap) without
  * trailing newlines. Sets $? to the subshell's status. */
 char *command_substitute(const char *cmd);
+unsigned long command_subst_count(void); /* substitutions run so far */
 /* <(cmd) (to_cmd 0) or >(cmd) (to_cmd 1): starts cmd on a pipe and
  * returns the shell's end, open until process_close_from(mark). */
 int   process_substitute(const char *cmd, int to_cmd);
