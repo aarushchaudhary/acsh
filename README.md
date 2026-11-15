@@ -6,7 +6,8 @@ handful of fixes for things `ash` users regularly run into.
 
 Every claim below points at the test that checks it. Statements about
 `ash` were checked against BusyBox `ash` 1.37, the reference the
-differential tests run against.
+differential tests run against locally; CI runs them against the busybox
+that Ubuntu and Alpine ship (1.36).
 
 **Status:** the scripting language matches `ash` (phase 2 of the
 roadmap). Interactive line editing, tab completion and `PS1` prompts are
@@ -47,7 +48,7 @@ musl as is; on a glibc system install musl-tools and run
 | Suite | What it checks |
 |---|---|
 | `tests/run_diff.sh` | Runs each of the 47 scripts in `tests/diff/` under acsh **and** under BusyBox `ash`, and requires identical stdout and exit status. |
-| `./acsh test_acsh.sh` | 75 checks, mostly of features that `ash` does not share (so they cannot be diffed), plus interactive behaviour through `-i`. |
+| `./acsh test_acsh.sh` | 77 checks, mostly of features that `ash` does not share (so they cannot be diffed), plus interactive behaviour through `-i`. |
 | Sanitizers | Both suites are also run against an ASan/UBSan/LSan build, with no reports. |
 | CI | `.github/workflows/ci.yml`, on every push: both suites on Ubuntu; both suites on Alpine 3.20 (musl) against Alpine's own busybox `ash`, plus a login shell running Alpine's `/etc/profile`; and the static musl binary run in an empty `FROM scratch` container. |
 
@@ -67,7 +68,7 @@ Every item in this table is covered by a differential test, so it behaves as `as
 |---|---|---|
 | Grammar | pipelines, `!`, `&&` `\|\|`, `;` `&`, `( )`, `{ }`, `if`, `while`, `until`, `for`, `case` (including `(pat)`), functions (`f() {}` and `function f {}`), aliases (including values ending in a blank and aliases inside alias text) | `grammar_*`, `script_aliases`, `posix_misc`, `ash_extensions2` |
 | Quoting | `'...'`, `"..."`, `\`, `$'...'` | `grammar_quoting`, `ash_extensions2` |
-| Parameters | `$1`…, `$#`, `$@`, `$*`, `$?`, `$$`, `$!`, `$-`, `$0`, `$PPID`, `$LINENO`, `$RANDOM`, `$EPOCHSECONDS`, `$EPOCHREALTIME` | `script_args`, `ash_extensions*`, `builtins_env` |
+| Parameters | `$1`…, `$#`, `$@`, `$*`, `$?`, `$$`, `$!`, `$-`, `$0`, `$PPID`, `$LINENO`, `$RANDOM`, `$EPOCHSECONDS` and `$EPOCHREALTIME` (busybox 1.37 and later) | `script_args`, `ash_extensions*`, `builtins_env`, test_acsh [2.28] |
 | Expansions | `${x:-}` `${x:=}` `${x:?}` `${x:+}` `${#x}` `${x#}` `${x##}` `${x%}` `${x%%}` `${x:off:len}` `${x/a/b}` `${x//a/b}`, tilde expansion, `$(...)` and backticks, `<(...)` and `>(...)` | `expand_*`, `ash_extensions*` |
 | Arithmetic | full C operator set, assignments, `**`, `,`, `?:`, `16#ff` bases, variables evaluated as expressions | `expand_arith`, `ash_extensions2` |
 | Field splitting and globbing | `$IFS` rules, `*` `?` `[...]`, `[[:class:]]`, `set -f`; `${#x}` counts characters in a UTF-8 locale | `expand_split`, `glob_many`, `posix_misc`, `ash_extensions2` |

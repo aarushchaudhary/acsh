@@ -16,8 +16,6 @@ echo upper > >(tr a-z A-Z); sleep 0.2
 h() { cat <(echo in-function); }; h
 echo $((16#ff)) $((2#1010)) $((8#17)) $((36#z)) $((64#_))
 echo $((2**10)) $((2**0)) $((3**3**2)) $((-2**2)) $((x=2, x**3)) $(( (1,5)*2 ))
-echo "$EPOCHSECONDS" | grep -c '^[0-9][0-9]*$'
-echo "$EPOCHREALTIME" | grep -c '^[0-9][0-9]*\.[0-9]\{6\}$'
 for v in OPTIND IFS PS2 PS4 HOSTNAME PPID; do eval "s=\${$v+set}"; echo "$v=$s"; done
 printf '[%s]\n' "$IFS$PS2$PS4$OPTIND"
 x=3+4; echo $((x*2)); y=abc; echo $((y+1)); abc=5; echo $((y+1)); x=abc; echo $((x=2))

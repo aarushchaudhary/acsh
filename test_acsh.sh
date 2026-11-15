@@ -511,6 +511,10 @@ check_eq "a non-interactive shell does not" "[]" "$RESULT"
 rm -f /tmp/acsh_test_env.sh
 RESULT=$(env -i ./acsh -c 'echo "$PATH"')
 check_eq "an unset PATH gets ash's default" "/sbin:/usr/sbin:/bin:/usr/bin" "$RESULT"
+RESULT=$(echo "$EPOCHSECONDS" | grep -c '^[0-9][0-9]*$')
+check_eq "\$EPOCHSECONDS is a number (busybox 1.37 has it, 1.36 does not)" "1" "$RESULT"
+RESULT=$(echo "$EPOCHREALTIME" | grep -c '^[0-9][0-9]*\.[0-9]\{6\}$')
+check_eq "\$EPOCHREALTIME has microseconds" "1" "$RESULT"
 
 
 echo ""
