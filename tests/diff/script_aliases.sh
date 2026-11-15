@@ -16,3 +16,5 @@ a1 2>/dev/null; echo "alias loop status $?"
 alias q="it's"; alias q
 alias lsx='ls -x'
 alias lsx
+# unalias -a removes every alias
+alias u1=true u2=false; unalias -a; alias; echo "after unalias -a: $(alias | wc -l)"

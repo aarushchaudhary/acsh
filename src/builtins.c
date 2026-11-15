@@ -413,8 +413,12 @@ static int builtin_alias(Command *cmd) {
 
 static int builtin_unalias(Command *cmd) {
     if (cmd->argc < 2) {
-        shell_error("unalias: usage: unalias NAME [NAME ...]\n");
+        shell_error("unalias: usage: unalias -a | NAME [NAME ...]\n");
         return 1;
+    }
+    if (strcmp(cmd->argv[1], "-a") == 0) {
+        alias_clear();
+        return 0;
     }
     for (int i = 1; i < cmd->argc; i++) {
         alias_unset(cmd->argv[i]);

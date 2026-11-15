@@ -75,6 +75,10 @@ void alias_unset(const char *name) {
     naliases--;
 }
 
+void alias_clear(void) {
+    while (naliases > 0) alias_unset(aliases[naliases - 1].name);
+}
+
 const char *alias_get(const char *name) {
     int i = find(name);
     return i >= 0 ? aliases[i].value : NULL;

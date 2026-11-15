@@ -330,6 +330,7 @@ void alias_load_defaults(void);
 void print_single_quoted(const char *s); /* 'value', a ' inside as '"'"' (vars.c) */
 void alias_set(const char *name, const char *value);
 void alias_unset(const char *name);
+void alias_clear(void);  /* unalias -a */
 const char *alias_get(const char *name);
 void alias_print(const char *name, const char *value);
 void alias_print_all(void);
