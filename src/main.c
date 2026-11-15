@@ -76,7 +76,17 @@ static char *file_lines(void *ctx, int continuation) {
     return echo_if_verbose(reader_line((LineReader *)ctx));
 }
 
-static LineReader stdin_reader = { 0, { 0 }, 0, 0 };
+/* The reader for standard input, allocated when first used: `-c` and
+ * scripts never need it, and a 4 KB buffer in static memory would cost
+ * every start a page fault. */
+static LineReader *stdin_reader(void) {
+    static LineReader *r;
+    if (r == NULL && (r = calloc(1, sizeof(*r))) == NULL) {
+        shell_error("out of memory\n");
+        exit(2);
+    }
+    return r;
+}
 
 /* LineSource for standard input. At the interactive prompt it prints
  * PS1 or PS2 and records history; otherwise (commands piped in, -s) it
@@ -84,7 +94,7 @@ static LineReader stdin_reader = { 0, { 0 }, 0, 0 };
 static char *stdin_lines(void *ctx, int continuation) {
     (void)ctx;
     if (!interactive) {
-        return echo_if_verbose(reader_line(&stdin_reader));
+        return echo_if_verbose(reader_line(stdin_reader()));
     }
     if (continuation && shell_interrupted()) {
         return NULL;  /* Ctrl-C cancelled this command: no more lines for it */
@@ -111,7 +121,7 @@ static char *stdin_lines(void *ctx, int continuation) {
         line = echo_if_verbose(line);
     } else {
         prompt_print(continuation ? "PS2" : "PS1");
-        line = echo_if_verbose(reader_line(&stdin_reader));
+        line = echo_if_verbose(reader_line(stdin_reader()));
     }
     if (line == NULL) {
         return NULL;

@@ -26,7 +26,7 @@ typedef struct Var {
  * a hundred variables). Anything set later is allocated on its own. */
 enum { OWN_STRUCT = 1, OWN_NAME = 2, OWN_VALUE = 4 };
 
-#define NBUCKETS 256
+#define NBUCKETS 64   /* ash has 39; a shell holds tens of variables */
 static Var *table[NBUCKETS];
 
 static unsigned hash(const char *s) {

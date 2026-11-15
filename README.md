@@ -516,30 +516,36 @@ xychart-beta
 
 ```mermaid
 xychart-beta
-    title "Idle memory (RSS, KB, middle of the measured range)"
+    title "Idle memory (RSS, KB)"
     x-axis ["ash only", "acsh MINIMAL=1", "acsh full"]
     y-axis "KB" 0 --> 320
-    bar [266, 280, 294]
+    bar [264, 272, 292]
 ```
 
 | Build | Size (stripped) | Idle RSS | 1,000 × `-c true` |
 |---|---|---|---|
-| BusyBox 1.36.1, `ash` only | 223,032 B | 264–268 KB | 244–276 ms |
-| acsh `MINIMAL=1` | 243,408 B | 280 KB | 253–288 ms |
-| acsh full | 251,600 B | 292–296 KB | 251–285 ms |
+| BusyBox 1.36.1, `ash` only | 223,032 B | 264 KB | 246 ms |
+| acsh `MINIMAL=1` | 243,408 B | 272 KB | 248 ms |
+| acsh full | 251,600 B | 292 KB | 265 ms |
 
 | Roadmap target | Result |
 |---|---|
 | minimal build no slower than `ash` | **met** (within 5%; with a full environment of 106 variables acsh starts faster: 1.22–1.29 s against 1.28–1.33 s for 5,000 runs) |
 | full build within 1.5× of `ash`'s size | **met** (1.13×) |
 | minimal build no bigger than `ash` | **not met**: 9% bigger (20 KB) |
-| minimal build no heavier than `ash` | **not met**: 12–16 KB more RSS |
+| minimal build no heavier than `ash` | **not met**: 8 KB more RSS |
 
 What closed most of the gap: building non-PIE and with `-Oz`; importing
 the environment with 2 allocations instead of 3 per variable (startup
 was 13–25% slower before); allocating the function-call frames and
-seeding `$RANDOM` only when first needed (memory was 40 KB higher). The
-rest is acsh's own code, about 20 KB more than `ash`'s; removing
+seeding `$RANDOM` only when first needed (memory was 40 KB higher);
+allocating the 4 KB standard-input buffer only when standard input is
+read, and a 64-bucket variable table instead of 256 (`ash` has 39).
+After these, a start of the minimal build causes as many page faults as
+`ash` (29.6 against 29.4) and makes fewer system calls (21 against 23).
+(Before those last two changes, CI's Alpine run measured the minimal
+build 6% slower than `ash`, 180 ms against 170 ms: just over the gate.)
+The rest is acsh's own code, about 20 KB more than `ash`'s; removing
 features to close it was ruled out. The `bench` job reports the two
 unmet targets as known gaps and fails if they are ever met, so the gate
 can be made strict again.
@@ -604,7 +610,7 @@ code merged into one, a duplicate name check, dead code).
 
 - **Size and memory of the smallest build.** Statically linked with
   musl, `make static MINIMAL=1` is 9% bigger than an `ash`-only BusyBox
-  and uses 12–16 KB more memory; it starts as fast. See
+  and uses 8 KB more memory; it starts as fast. See
   [Evidence](#evidence).
 - **Speed of long scripts.** BusyBox runs many applets (`ls`, `cat`…)
   inside the shell process without forking; acsh always runs external
