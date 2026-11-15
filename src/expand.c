@@ -140,6 +140,18 @@ typedef struct {
 static long arith_assign(Arith *ar);
 static long arith_comma(Arith *ar);
 
+/* 64-bit two's-complement arithmetic that wraps on overflow, as ash and
+ * bash do, without C's undefined behavior: done in unsigned, shift
+ * counts taken mod 64, and LONG_MIN / -1 (a trap on x86) as negation. */
+static long w_add(long a, long b) { return (long)((unsigned long)a + (unsigned long)b); }
+static long w_sub(long a, long b) { return (long)((unsigned long)a - (unsigned long)b); }
+static long w_mul(long a, long b) { return (long)((unsigned long)a * (unsigned long)b); }
+static long w_neg(long a)         { return (long)(0UL - (unsigned long)a); }
+static long w_shl(long a, long b) { return (long)((unsigned long)a << (b & 63)); }
+static long w_shr(long a, long b) { return a >> (b & 63); }
+static long w_div(long a, long b) { return b == -1 ? w_neg(a) : a / b; }
+static long w_mod(long a, long b) { return b == -1 ? 0 : a % b; }
+
 static void ws(Arith *ar) {
     while (isspace((unsigned char)ar->s[ar->p])) ar->p++;
 }
@@ -211,6 +223,10 @@ static int read_name(Arith *ar, char *name, size_t size) {
 static long arith_primary(Arith *ar) {
     ws(ar);
     char c = ar->s[ar->p];
+    if (stack_exhausted()) {
+        arith_fail(ar, "arithmetic expression nested too deeply");
+        return 0;
+    }
     if (c == '(') {
         ar->p++;
         long v = arith_comma(ar);
@@ -234,7 +250,7 @@ static long arith_primary(Arith *ar) {
                 else if (*d == '_') digit = 63;
                 else break;
                 if (digit >= base) break;
-                v = v * base + digit;
+                v = w_add(w_mul(v, base), digit);
             }
             end = (char *)d;
         }
@@ -245,8 +261,8 @@ static long arith_primary(Arith *ar) {
     char name[256];
     if (read_name(ar, name, sizeof(name))) {
         long v = var_value(ar, name);
-        if (take_op(ar, "++")) { set_var(ar, name, v + 1); return v; }
-        if (take_op(ar, "--")) { set_var(ar, name, v - 1); return v; }
+        if (take_op(ar, "++")) { set_var(ar, name, w_add(v, 1)); return v; }
+        if (take_op(ar, "--")) { set_var(ar, name, w_sub(v, 1)); return v; }
         return v;
     }
     arith_fail(ar, "arithmetic syntax error");
@@ -254,13 +270,17 @@ static long arith_primary(Arith *ar) {
 }
 
 static long arith_unary(Arith *ar) {
+    if (stack_exhausted()) {
+        arith_fail(ar, "arithmetic expression nested too deeply");
+        return 0;
+    }
     char name[256];
     int inc = take_op(ar, "++");
     int dec = !inc && take_op(ar, "--");
     if (inc || dec) {
         size_t save = ar->p;
         if (read_name(ar, name, sizeof(name))) {
-            long v = var_value(ar, name) + (inc ? 1 : -1);
+            long v = w_add(var_value(ar, name), inc ? 1 : -1);
             set_var(ar, name, v);
             return v;
         }
@@ -269,7 +289,7 @@ static long arith_unary(Arith *ar) {
         return 0;
     }
     if (take_op(ar, "+")) return arith_unary(ar);
-    if (take_op(ar, "-")) return -arith_unary(ar);
+    if (take_op(ar, "-")) return w_neg(arith_unary(ar));
     if (take_op(ar, "!")) return !arith_unary(ar);
     if (take_op(ar, "~")) return ~arith_unary(ar);
     return arith_primary(ar);
@@ -287,7 +307,10 @@ static long arith_pow(Arith *ar) {
         return 0;
     }
     long r = 1;
-    while (e-- > 0) r *= v;
+    for (; e > 0; e >>= 1) {   /* by squaring: a huge exponent stays fast */
+        if (e & 1) r = w_mul(r, v);
+        v = w_mul(v, v);
+    }
     return r;
 }
 
@@ -301,13 +324,13 @@ static long arith_mul(Arith *ar) {
         else if (take_op(ar, "%")) op = '%';
         else return v;
         long r = arith_pow(ar);
-        if (op == '*') { v *= r; continue; }
+        if (op == '*') { v = w_mul(v, r); continue; }
         if (r == 0) {
             arith_fail(ar, "divide by zero");
             v = 0;
             continue;
         }
-        v = (op == '/') ? v / r : v % r;
+        v = (op == '/') ? w_div(v, r) : w_mod(v, r);
     }
 }
 
@@ -315,8 +338,8 @@ static long arith_add(Arith *ar) {
     long v = arith_mul(ar);
     for (;;) {
         if (at(ar, "+=") || at(ar, "-=") || at(ar, "++") || at(ar, "--")) return v;
-        if (take_op(ar, "+")) v += arith_mul(ar);
-        else if (take_op(ar, "-")) v -= arith_mul(ar);
+        if (take_op(ar, "+")) v = w_add(v, arith_mul(ar));
+        else if (take_op(ar, "-")) v = w_sub(v, arith_mul(ar));
         else return v;
     }
 }
@@ -325,8 +348,8 @@ static long arith_shift(Arith *ar) {
     long v = arith_add(ar);
     for (;;) {
         if (at(ar, "<<=") || at(ar, ">>=")) return v;
-        if (take_op(ar, "<<")) v <<= arith_add(ar);
-        else if (take_op(ar, ">>")) v >>= arith_add(ar);
+        if (take_op(ar, "<<")) v = w_shl(v, arith_add(ar));
+        else if (take_op(ar, ">>")) v = w_shr(v, arith_add(ar));
         else return v;
     }
 }
@@ -394,6 +417,10 @@ static long arith_lor(Arith *ar) {
 }
 
 static long arith_ternary(Arith *ar) {
+    if (stack_exhausted()) {
+        arith_fail(ar, "arithmetic expression nested too deeply");
+        return 0;
+    }
     long c = arith_lor(ar);
     if (!take_op(ar, "?")) return c;
     int skip = ar->skip;
@@ -407,6 +434,10 @@ static long arith_ternary(Arith *ar) {
 }
 
 static long arith_assign(Arith *ar) {
+    if (stack_exhausted()) {
+        arith_fail(ar, "arithmetic expression nested too deeply");
+        return 0;
+    }
     size_t save = ar->p;
     char name[256];
     if (read_name(ar, name, sizeof(name))) {
@@ -418,15 +449,15 @@ static long arith_assign(Arith *ar) {
                 long v = (ops[i][0] == '=') ? 0 : var_value(ar, name); /* x=1 ignores the old value */
                 switch (ops[i][0]) {
                 case '=': v = r; break;
-                case '+': v += r; break;
-                case '-': v -= r; break;
-                case '*': v *= r; break;
+                case '+': v = w_add(v, r); break;
+                case '-': v = w_sub(v, r); break;
+                case '*': v = w_mul(v, r); break;
                 case '/': case '%':
                     if (r == 0) { arith_fail(ar, "divide by zero"); return 0; }
-                    v = (ops[i][0] == '/') ? v / r : v % r;
+                    v = (ops[i][0] == '/') ? w_div(v, r) : w_mod(v, r);
                     break;
-                case '<': v <<= r; break;
-                case '>': v >>= r; break;
+                case '<': v = w_shl(v, r); break;
+                case '>': v = w_shr(v, r); break;
                 case '&': v &= r; break;
                 case '^': v ^= r; break;
                 case '|': v |= r; break;
@@ -616,6 +647,12 @@ static void expand_substring(Buf *b, const char *name, const char *spec, int dq,
     long len = have_len ? arith_raw(copy + colon + 1) : 0;
     free(copy);
     if (failed) return;
+    /* no string is 2^40 long: clamping keeps the sums below from overflowing */
+    const long cap = 1L << 40;
+    if (off > cap) off = cap;
+    if (off < -cap) off = -cap;
+    if (len > cap) len = cap;
+    if (len < -cap) len = -cap;
 
     if (strcmp(name, "@") == 0 || strcmp(name, "*") == 0) {
         int n = env_positional_count();
@@ -650,6 +687,37 @@ static void expand_substring(Buf *b, const char *name, const char *spec, int dq,
 /* ${x/pat/rep} ${x//pat/rep}: replace the first (or every) longest
  * match of pat. ${x/#pat/rep} and ${x/%pat/rep} anchor the match at the
  * start or end (bash; ash takes # and % literally). */
+/* How many characters every match of a glob pattern has: -1 when it
+ * contains * (any length). `a?[bc]` is 3. */
+static long pattern_fixed_length(const char *p) {
+    long n = 0;
+    while (*p) {
+        if (*p == '*') return -1;
+        if (*p == '\\' && p[1]) {
+            p += 2;
+        } else if (*p == '[') {
+            const char *q = p + 1;
+            if (*q == '!' || *q == '^') q++;
+            if (*q == ']') q++;
+            while (*q && *q != ']') {
+                if (*q == '[' && (q[1] == ':' || q[1] == '.' || q[1] == '=')) {
+                    char close = q[1];
+                    q += 2;
+                    while (*q && !(*q == close && q[1] == ']')) q++;
+                    if (*q) q += 2;
+                } else {
+                    q++;
+                }
+            }
+            p = (*q == ']') ? q + 1 : p + 1;   /* no closing ]: a literal [ */
+        } else {
+            p++;
+        }
+        n++;
+    }
+    return n;
+}
+
 static void expand_replace(Buf *b, const char *name, const char *spec, int dq) {
     int all = 0, anchor = 0;
     if (*spec == '/') { all = 1; spec++; }
@@ -668,11 +736,22 @@ static void expand_replace(Buf *b, const char *name, const char *spec, int dq) {
     char *tmp = malloc(vlen + 1);
     size_t i = 0;
     int replaced = 0;
+    /* without a *, a match has one possible length: try only that one,
+     * so ${x//a/b} on a long value stays linear */
+    long fixed = pattern_fixed_length(pattern);
     while (i <= vlen) {
         size_t match = 0;
         int found = 0;
-        if (*pattern && !(replaced && !all) && !(anchor == '#' && i > 0)) {
-            for (size_t l = vlen - i + 1; l-- > 0;) {   /* longest first */
+        /* an empty match at the very end, after the text before it was
+         * matched, is not another match (replacing all of x with the
+         * pattern star gives one copy, not two) */
+        if (*pattern && !(replaced && !all) && !(anchor == '#' && i > 0) && !(replaced && i == vlen)) {
+            size_t top = vlen - i + 1, low = 0;   /* lengths tried: top-1 down to low */
+            if (fixed >= 0) {
+                top = ((size_t)fixed <= vlen - i) ? (size_t)fixed + 1 : 0;
+                low = (size_t)fixed;
+            }
+            for (size_t l = top; l-- > low;) {   /* longest first */
                 if (anchor == '%' && i + l != vlen) continue;
                 memcpy(tmp, v + i, l);
                 tmp[l] = '\0';
@@ -701,6 +780,22 @@ static void expand_replace(Buf *b, const char *name, const char *spec, int dq) {
     free(value);
     free(pattern);
     free(rep);
+}
+
+/* "${...}: bad substitution", naming the bash feature when it is one:
+ * a script written for bash then says what to change. */
+static void bad_substitution(const char *inner) {
+    const char *p = inner + (*inner == '!' || *inner == '#');
+    while (is_name_char(*p)) p++;
+    const char *hint = NULL;
+    if (*inner == '!') hint = "indirection (${!name}) is a bash feature; use eval: eval \"v=\\$$name\"";
+    else if (*p == '[') hint = "arrays are a bash feature; use a space-separated list, or set -- a b c and $1 $2";
+    else if (*p == '^' || *p == ',') hint = "case changing is a bash feature; use tr: $(printf %s \"$x\" | tr a-z A-Z)";
+    else if (*p == '@') hint = "${name@...} transformations are a bash feature";
+    shell_error_prefix();
+    if (hint != NULL) fprintf(stderr, "${%s}: bad substitution: %s\n", inner, hint);
+    else fprintf(stderr, "${%s}: bad substitution\n", inner);
+    failed = 1;
 }
 
 /* ${...}: inner is the text between the braces. */
@@ -763,7 +858,7 @@ static void expand_braced(Buf *b, const char *inner, int dq, int *empty_at) {
         n = 1;
     }
     if (n == 0) {
-        fail("${%s}: bad substitution", inner);
+        bad_substitution(inner);
         return;
     }
     char *name = strndup(p, n);
@@ -810,7 +905,7 @@ static void expand_braced(Buf *b, const char *inner, int dq, int *empty_at) {
             free(out);
             free(pattern);
         } else {
-            fail("${%s}: bad substitution", inner);
+            bad_substitution(inner);
         }
         free(value);
         free(name);
@@ -962,7 +1057,24 @@ static size_t expand_tilde(Buf *b, const char *w, size_t i, int assign) {
 /* Expands one marked word into b. lit_as_exp: typed text counts as an
  * expansion result (the word of an unquoted ${x:-word}). assign: tilde
  * prefixes are also recognized after ':' (assignment values). */
+static void expand_into_word(Buf *b, const char *w, int lit_as_exp, int assign);
+
+/* ${...} inside ${...} re-reads the inner text at every level, so very
+ * deep nesting costs time as well as stack: stop at ACSH_MAX_NESTING
+ * (no real script comes near it) or when the stack runs low. */
 static void expand_into(Buf *b, const char *w, int lit_as_exp, int assign) {
+    static int depth = 0;
+    if (depth >= ACSH_MAX_NESTING || stack_exhausted()) {
+        if (!failed) fail("%s", "expansion nested too deeply");
+        failed = 1;
+        return;
+    }
+    depth++;
+    expand_into_word(b, w, lit_as_exp, assign);
+    depth--;
+}
+
+static void expand_into_word(Buf *b, const char *w, int lit_as_exp, int assign) {
     int sq = 0, dq = 0;
     size_t dq_mark = 0;
     int empty_at = 0;
@@ -1042,8 +1154,14 @@ static int has_glob(const Buf *f) {
     return 0;
 }
 
+/* Appends s to a NULL-terminated array that started out NULL with *n 0.
+ * The array doubles whenever *n + 1 reaches a power of two, so a
+ * million fields cost a few dozen reallocations, not a million. */
 static void push_field(char ***out, int *n, char *s) {
-    *out = realloc(*out, (size_t)(*n + 2) * sizeof(char *));
+    size_t used = (size_t)*n + 1;           /* items plus the NULL */
+    if ((used & (used - 1)) == 0) {         /* full: the capacity is a power of two */
+        *out = realloc(*out, used * 2 * sizeof(char *));
+    }
     if (*out == NULL) {
         shell_error("out of memory\n");
         exit(2);
@@ -1125,6 +1243,155 @@ static void split_fields(const Buf *b, char ***out, int *n) {
     bfree(&f);
 }
 
+/* ---- brace expansion (bash): {a,b,c}, {1..5}, {a..e}, {01..10..2} ----
+ * Done on the marked word before every other expansion. Quoted text,
+ * ${...}, $(...) and `...` are left alone, a brace with neither a comma
+ * nor a valid sequence stays as it is ({a}, {}, {1..x}), and set +B
+ * (set +o braceexpand) turns it off for strict POSIX scripts. */
+
+#define BRACE_MAX_WORDS 4000000   /* {1..4000000}; more is a mistake, not a list */
+
+typedef struct { char **w; int n, cap; } WordList;
+
+static void wl_push(WordList *l, char *s) {
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 8;
+        l->w = realloc(l->w, (size_t)l->cap * sizeof(char *));
+    }
+    l->w[l->n++] = s;
+}
+
+/* Index after the region starting at w[i] that brace expansion must not
+ * look into (quotes, $..., `...`), or i if w[i] starts none. */
+static size_t skip_region(const char *w, size_t i) {
+    char c = w[i];
+    if (c == SQ_START || c == DQ_START) {
+        char end = (c == SQ_START) ? SQ_END : DQ_END;
+        while (w[i] && w[i] != end) i++;
+        return w[i] ? i + 1 : i;
+    }
+    if (c == '$' && (w[i + 1] == '{' || w[i + 1] == '(')) {
+        size_t close = (w[i + 1] == '{') ? match_brace(w, i + 1) : match_paren(w, i + 1);
+        return w[close] ? close + 1 : close;
+    }
+    if (c == '`') {
+        for (i++; w[i] && w[i] != '`'; i++) if (w[i] == '\\' && w[i + 1]) i++;
+        return w[i] ? i + 1 : i;
+    }
+    return i;
+}
+
+/* A sequence {X..Y} or {X..Y..STEP} in text[0, len): adds each item. */
+static int brace_sequence(const char *text, size_t len, WordList *items) {
+    char buf[64];
+    if (len >= sizeof(buf)) return 0;
+    memcpy(buf, text, len);
+    buf[len] = '\0';
+    char *dots = strstr(buf, "..");
+    if (dots == NULL) return 0;
+    *dots = '\0';
+    char *a = buf, *b = dots + 2, *step_s = strstr(b, "..");
+    long step = 1;
+    if (step_s != NULL) {
+        *step_s = '\0';
+        char *end;
+        step = strtol(step_s + 2, &end, 10);
+        if (step_s[2] == '\0' || *end != '\0') return 0;
+        if (step < 0) step = -step;
+        if (step == 0) step = 1;
+    }
+    char *ea, *eb;
+    long x = strtol(a, &ea, 10), y = strtol(b, &eb, 10);
+    if (*a && *b && *ea == '\0' && *eb == '\0') {
+        /* numbers; a leading zero on either end pads all to the same width */
+        int width = 0;
+        const char *da = (*a == '-') ? a + 1 : a, *db = (*b == '-') ? b + 1 : b;
+        if ((da[0] == '0' && da[1]) || (db[0] == '0' && db[1])) {
+            width = (int)(strlen(a) > strlen(b) ? strlen(a) : strlen(b));
+        }
+        long count = (x <= y ? y - x : x - y) / step + 1;
+        if (count > BRACE_MAX_WORDS) return -1;
+        for (long v = x, k = 0; k < count; k++, v += (x <= y ? step : -step)) {
+            char num[48];
+            if (width) snprintf(num, sizeof(num), v < 0 ? "-%0*ld" : "%0*ld", v < 0 ? width - 1 : width, v < 0 ? -v : v);
+            else snprintf(num, sizeof(num), "%ld", v);
+            wl_push(items, strdup(num));
+        }
+        return 1;
+    }
+    if (strlen(a) == 1 && strlen(b) == 1 && isalpha((unsigned char)*a) && isalpha((unsigned char)*b)) {
+        int from = (unsigned char)*a, to = (unsigned char)*b;
+        for (int v = from; from <= to ? v <= to : v >= to; v += (from <= to ? (int)step : -(int)step)) {
+            char one[4] = { (char)v, '\0', '\0', '\0' };
+            if (v == '\\') { one[0] = SQ_START; one[1] = SQ_END; }  /* bash makes this an empty word */
+            else if (strchr("`$\"'", v)) { one[0] = SQ_START; one[1] = (char)v; one[2] = SQ_END; }
+            wl_push(items, strdup(one));
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* Expands the first brace expression in w (then the results, for the
+ * rest) into *out. Returns 0, or -1 when it would make too many words. */
+static int brace_expand_into(const char *w, WordList *out, int depth) {
+    for (size_t i = 0; w[i];) {
+        size_t after = skip_region(w, i);
+        if (after != i) { i = after; continue; }
+        if (w[i] == '\\' && w[i + 1]) { i += 2; continue; }
+        if (w[i] != '{') { i++; continue; }
+        /* the matching }, and the commas at this level */
+        size_t commas[256];
+        int ncommas = 0, level = 0;
+        size_t j = i + 1, close = 0;
+        while (w[j]) {
+            size_t a2 = skip_region(w, j);
+            if (a2 != j) { j = a2; continue; }
+            if (w[j] == '\\' && w[j + 1]) { j += 2; continue; }
+            if (w[j] == '{') level++;
+            else if (w[j] == '}') {
+                if (level == 0) { close = j; break; }
+                level--;
+            } else if (w[j] == ',' && level == 0 && ncommas < 256) {
+                commas[ncommas++] = j;
+            }
+            j++;
+        }
+        if (close == 0) return wl_push(out, strdup(w)), 0;   /* no closing brace: nothing to do */
+        WordList items = { 0 };
+        if (ncommas > 0) {
+            size_t start = i + 1;
+            for (int k = 0; k <= ncommas; k++) {
+                size_t end = (k < ncommas) ? commas[k] : close;
+                wl_push(&items, strndup(w + start, end - start));
+                start = end + 1;
+            }
+        } else {
+            int r = brace_sequence(w + i + 1, close - i - 1, &items);
+            if (r < 0) { free(items.w); return -1; }
+            if (r == 0) { i++; continue; }        /* {a} or {x..y..z}: literal, look further on */
+        }
+        int status = 0;
+        for (int k = 0; k < items.n; k++) {
+            size_t pl = i, il = strlen(items.w[k]), sl = strlen(w + close + 1);
+            char *joined = malloc(pl + il + sl + 1);
+            memcpy(joined, w, pl);
+            memcpy(joined + pl, items.w[k], il);
+            memcpy(joined + pl + il, w + close + 1, sl + 1);
+            if (status == 0 && (out->n > BRACE_MAX_WORDS || depth > 64 ||
+                                brace_expand_into(joined, out, depth + 1) != 0)) {
+                status = -1;
+            }
+            free(joined);
+            free(items.w[k]);
+        }
+        free(items.w);
+        return status;
+    }
+    wl_push(out, strdup(w));
+    return 0;
+}
+
 /* ---- public API ---- */
 
 int expand_fields(char **words, int nwords, char ***out, int *nout) {
@@ -1134,10 +1401,24 @@ int expand_fields(char **words, int nwords, char ***out, int *nout) {
     *nout = 0;
     failed = 0;
     for (int i = 0; i < nwords && !failed; i++) {
-        Buf b = { 0 };
-        expand_into(&b, words[i], 0, 0);
-        if (!failed) split_fields(&b, out, nout);
-        bfree(&b);
+        WordList braced = { 0 };
+        if (shell_option('B') && strchr(words[i], '{') != NULL) {
+            if (brace_expand_into(words[i], &braced, 0) != 0) {
+                fail("%s", "brace expansion makes too many words");
+            }
+        } else {
+            wl_push(&braced, strdup(words[i]));
+        }
+        for (int k = 0; k < braced.n; k++) {
+            if (!failed) {
+                Buf b = { 0 };
+                expand_into(&b, braced.w[k], 0, 0);
+                if (!failed) split_fields(&b, out, nout);
+                bfree(&b);
+            }
+            free(braced.w[k]);
+        }
+        free(braced.w);
     }
     if (failed) {
         for (int i = 0; i < *nout; i++) free((*out)[i]);

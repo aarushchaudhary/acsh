@@ -108,6 +108,7 @@ static const char *describe(Token *t) {
     case T_OR_IF:     return "||";
     case T_DSEMI:     return ";;";
     case T_SEMIAND:   return ";&";
+    case T_TLESS:     return "<<<";
     case T_LPAREN:    return "(";
     case T_RPAREN:    return ")";
     case T_LESS:      return "<";
@@ -208,10 +209,12 @@ Node *node_ref(Node *n) {
     return n;
 }
 
+/* Lists (a; b; c and a && b || c) are chains leaning left, as long as
+ * the script: they are freed in a loop, not by recursion, so a long
+ * list cannot exhaust the C stack. */
 void node_unref(Node *n) {
-    if (n == NULL || --n->refs > 0) {
-        return;
-    }
+    while (n != NULL && --n->refs <= 0) {
+    Node *next = NULL;
     free_redirs(n->redirs);
     free(n->text);
     switch (n->kind) {
@@ -224,8 +227,8 @@ void node_unref(Node *n) {
         free(n->u.pipe.cmds);
         break;
     case N_AND: case N_OR: case N_SEQ:
-        node_unref(n->u.bin.left);
         node_unref(n->u.bin.right);
+        next = n->u.bin.left;
         break;
     case N_BACKGROUND: case N_SUBSHELL: case N_GROUP:
         node_unref(n->u.sub.body);
@@ -262,6 +265,8 @@ void node_unref(Node *n) {
         break;
     }
     free(n);
+    n = next;
+    }
 }
 
 /* ---- grammar ---- */
@@ -291,7 +296,7 @@ static int is_redirect_start(Token *t) {
     switch (t->type) {
     case T_IO_NUMBER: case T_LESS: case T_GREAT: case T_DGREAT: case T_LESSAND:
     case T_GREATAND: case T_LESSGREAT: case T_CLOBBER: case T_DLESS: case T_DLESSDASH:
-    case T_ANDGREAT: case T_ANDDGREAT:
+    case T_ANDGREAT: case T_ANDDGREAT: case T_TLESS:
         return 1;
     default:
         return 0;
@@ -323,9 +328,11 @@ static int parse_redirect(Parser *p, Redir **list) {
     case T_GREATAND:  kind = R_DUP;    default_fd = 1; break;
     case T_DLESS:     kind = R_HEREDOC; default_fd = 0; break;
     case T_DLESSDASH: kind = R_HEREDOC; default_fd = 0; break;
+    case T_TLESS:     kind = R_HERESTRING; default_fd = 0; break;
     case T_ANDGREAT:  kind = R_OUT;    default_fd = 1; break;
     case T_ANDDGREAT: kind = R_APPEND; default_fd = 1; break;
     default:
+        free(op.text);
         fail_unexpected(p);
         return -1;
     }
@@ -432,6 +439,12 @@ static Node *parse_dbracket(Parser *p, char *open) {
     return NULL;
 }
 
+/* NAME= with nothing after the = (so the next token decides): a=(1 2) */
+static int ends_with_equals(const char *assign) {
+    size_t n = strlen(assign);
+    return n > 0 && assign[n - 1] == '=';
+}
+
 static Node *parse_simple(Parser *p, char *first_word) {
     Node *n = node_new(N_SIMPLE);
     if (first_word != NULL) {
@@ -448,6 +461,11 @@ static Node *parse_simple(Parser *p, char *first_word) {
                 p->have = 0;
                 continue;
             }
+        }
+        if (t->type == T_LPAREN && n->u.simple.nwords == 0 && n->u.simple.nassigns > 0 &&
+            ends_with_equals(n->u.simple.assigns[n->u.simple.nassigns - 1])) {
+            fail(p, "list=\"a b c\"; for x in $list; do ...; done   or   set -- a b c", "arrays are a bash feature; use a space-separated list");
+            break;
         }
         if (is_redirect_start(t)) {
             if (parse_redirect(p, &n->redirs) != 0) break;
@@ -686,6 +704,9 @@ static Node *parse_funcdef(Parser *p, char *name, int keyword) {
 static Node *parse_command_at(Parser *p);
 
 static Node *parse_command(Parser *p) {
+    if (stack_exhausted()) {
+        return fail(p, NULL, "commands are nested too deeply");
+    }
     size_t start = peek(p)->start;
     Node *n = parse_command_at(p);
     if (n != NULL) {
@@ -722,6 +743,12 @@ static Node *parse_command_at(Parser *p) {
         }
         if (!w.quoted && is_name(w.text) && peek(p)->type == T_LPAREN) {
             return parse_funcdef(p, w.text, 0);
+        }
+        if (!w.quoted && strcmp(w.text, "select") == 0 && peek(p)->type == T_WORD &&
+            !peek(p)->quoted && is_name(peek(p)->text)) {
+            free(w.text);
+            return fail(p, "while printf '1) a  2) b: ' && read -r n; do case $n in 1) ...;; 2) ...;; esac; done",
+                        "select is a bash feature; use a while loop with read");
         }
         if (!w.quoted && strcmp(w.text, "function") == 0 && peek(p)->type == T_WORD) {
             /* function NAME [()] BODY, as in ash, bash and ksh */

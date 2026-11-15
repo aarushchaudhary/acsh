@@ -21,7 +21,25 @@
  * parent shell. fork() gives that isolation for free, and it also
  * lets us capture stdout simply by pointing the child's fd 1 at a
  * pipe -- no need to redirect anything inside the parent. */
+/* How many $(...) / <(...) enclose this process: a forked child
+ * inherits it, so the count spans the chain of subshells. */
+static int subst_depth = 0;
+
+static int subst_too_deep(void) {
+    if (subst_depth < ACSH_MAX_NESTING) return 0;
+    shell_error("command substitution nested too deeply\n");
+    return 1;
+}
+
 char *command_substitute(const char *cmd) {
+#ifdef ACSH_FUZZ
+    (void)cmd;                 /* fuzzing expansion must not run commands */
+    return strdup("");
+#endif
+    if (subst_too_deep()) {
+        env_set_last_status(2);
+        return strdup("");
+    }
     int pipefd[2];
     if (pipe(pipefd) < 0) {
         perror("acsh: pipe");
@@ -51,6 +69,7 @@ char *command_substitute(const char *cmd) {
 
         /* the subshell: a forked copy of this shell runs the text and
          * exits with its status; nothing it changes reaches the parent */
+        subst_depth++;
         child_setup_subshell();
         int status = run_string(cmd);
         fflush(stdout);
@@ -126,6 +145,11 @@ static int subst_fds[64];
 static int subst_count = 0;
 
 int process_substitute(const char *cmd, int to_cmd) {
+#ifdef ACSH_FUZZ
+    (void)cmd; (void)to_cmd;
+    return -1;
+#endif
+    if (subst_too_deep()) return -1;
     int p[2];
     if (subst_count >= (int)(sizeof(subst_fds) / sizeof(subst_fds[0]))) {
         shell_error("too many process substitutions\n");
@@ -148,6 +172,7 @@ int process_substitute(const char *cmd, int to_cmd) {
         close(p[0]);
         close(p[1]);
         for (int k = 0; k < subst_count; k++) close(subst_fds[k]);
+        subst_depth++;
         child_setup_subshell();
         int status = run_string(cmd);
         fflush(stdout);

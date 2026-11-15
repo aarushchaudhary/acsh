@@ -23,7 +23,8 @@
 #define ACSH_MAX_ALIASES   32     /* aliases stored */
 #define ACSH_MAX_JOBS      32     /* background/stopped jobs tracked at once */
 #define ACSH_MAX_FUNCTIONS 64     /* shell functions defined at once */
-#define ACSH_MAX_CALL_DEPTH 64    /* nested function calls (recursion limit) */
+#define ACSH_MAX_CALL_DEPTH 1000  /* nested function calls (recursion limit) */
+#define ACSH_MAX_NESTING    256   /* nested ${...} or $(...) inside one another */
 
 /* ---- builtins.c ---- */
 
@@ -340,16 +341,17 @@ void alias_print(const char *name, const char *value);
 void alias_print_all(void);
 
 /* ---- history.c ----
- *
- * The last ACSH_HISTORY_SIZE commands, kept in ~/.acsh_history (mode
- * 0600) and appended as they are typed. */
-
-#define ACSH_HISTORY_SIZE 200
-
-void history_load(void);
-void history_add(const char *line);   /* skips blanks and repeats */
-void history_save_append(void);       /* appends the newest entry to the file */
-void history_print_all(void);
+ * One entry per command (multi-line commands included) in memory and in
+ * $HISTFILE; $HISTSIZE, $HISTCONTROL and $HISTIGNORE as in bash. */
+void history_load(void);                 /* at interactive startup; saves at exit */
+void history_begin(const char *line);    /* the first line of a new command */
+void history_continue(const char *line); /* a further line of the same command */
+void history_finish(void);               /* the command is complete: write it out */
+int  history_length(void);
+const char *history_get(int i);          /* 0 = oldest */
+int  history_number(void);             /* the number the next entry gets */
+int  history_builtin(int argc, char **argv);
+int  fc_builtin(int argc, char **argv);
 
 /* ---- main.c ---- */
 
@@ -365,5 +367,37 @@ void shell_mark_subshell(void);
 int  shell_option(char c);
 void shell_set_option(char c, int on);
 const char *shell_option_string(void);  /* $- */
+
+/* limits.c: a guard against running out of C stack on deeply nested
+ * input. stack_init() at the top of main(); stack_exhausted() is true
+ * when the recursion should stop with an error. */
+void stack_init(void *base);
+int  stack_exhausted(void);
+
+/* prompt.c: PS1/PS2 with bash's backslash escapes (\u \h \w \$ \g for
+ * the git branch, \? ...) and then expansion. */
+char  *prompt_expand(const char *ps);   /* heap; may hold no-width markers */
+void   prompt_print(const char *which); /* "PS1" or "PS2", to stderr */
+char  *prompt_string(const char *which);/* expanded, heap (for the line editor) */
+size_t prompt_width(const char *s);     /* columns the expanded prompt's last line takes */
+
+/* lineedit.c: the interactive line editor (raw terminal mode).
+ * lineedit_read returns the line with its newline, "" when Ctrl-C
+ * cancelled it, NULL at end of input. */
+#ifdef ACSH_MINIMAL  /* make MINIMAL=1: plain line reading only */
+static inline int   lineedit_usable(void) { return 0; }
+static inline char *lineedit_read(const char *prompt) { (void)prompt; return 0; }
+#else
+int   lineedit_usable(void);
+char *lineedit_read(const char *prompt);
+#endif
+
+/* complete.c: Tab completion. Given the line and the cursor, returns the
+ * new line (heap) and sets *new_pos, or NULL when nothing changes. */
+char *lineedit_complete(const char *line, size_t pos, size_t *new_pos);
+void alias_each(void (*fn)(const char *name, void *ctx), void *ctx);
+void function_each(void (*fn)(const char *name, void *ctx), void *ctx);
+void var_each(void (*fn)(const char *name, void *ctx), void *ctx);
+void builtin_each(void (*fn)(const char *name, void *ctx), void *ctx);
 
 #endif /* ACSH_H */

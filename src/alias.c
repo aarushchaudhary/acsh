@@ -76,3 +76,10 @@ void alias_print_all(void) {
         }
     }
 }
+
+/* Every alias name, for Tab completion. */
+void alias_each(void (*fn)(const char *name, void *ctx), void *ctx) {
+    for (int i = 0; i < ACSH_MAX_ALIASES; i++) {
+        if (alias_table[i].in_use) fn(alias_table[i].name, ctx);
+    }
+}

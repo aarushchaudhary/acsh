@@ -27,6 +27,93 @@ jobs:
       - name: Differential tests against busybox ash
         run: tests/run_diff.sh ./acsh
 
+      - name: Interactive tests on a pty
+        run: make tests/pty/pty_test && tests/pty/pty_test ./acsh
+
+  sanitizers:
+    name: AddressSanitizer + UndefinedBehaviorSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build and comparison tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential busybox
+
+      - name: Build with sanitizers (as ./acsh, which test_acsh.sh runs)
+        run: make CFLAGS="-O1 -g -std=c11 -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+
+      - name: Both suites under the sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          sed -i 's/\r$//' test_acsh.sh
+          ./acsh test_acsh.sh
+          tests/run_diff.sh ./acsh
+          make tests/pty/pty_test
+          tests/pty/pty_test ./acsh
+
+  minimal:
+    name: MINIMAL=1 build (no line editor, completion or suggestions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build and comparison tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential busybox
+
+      - name: Build both and compare sizes
+        run: |
+          make && strip -o full.stripped acsh
+          make MINIMAL=1 && strip -o minimal.stripped acsh
+          ls -l full.stripped minimal.stripped
+
+      - name: All suites on the minimal build
+        run: |
+          sed -i 's/\r$//' test_acsh.sh
+          ./acsh test_acsh.sh
+          tests/run_diff.sh ./acsh
+          make tests/pty/pty_test && tests/pty/pty_test --minimal ./acsh
+
+  fuzz:
+    name: libFuzzer (parser and expansion, 2 minutes each)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the fuzz targets
+        run: make fuzz
+
+      - name: Seed corpora from the test scripts
+        run: |
+          mkdir -p corpus/parse corpus/expand
+          cp tests/diff/*.sh test_acsh.sh corpus/parse/
+          i=0
+          grep -h '\$' tests/diff/*.sh | grep -v '^#' | while IFS= read -r line; do
+            i=$((i+1)); printf '%s' "$line" > corpus/expand/seed$i
+          done
+
+      - name: Fuzz the parser
+        run: ./fuzz_parse -max_total_time=120 -max_len=4096 -timeout=10 -close_fd_mask=3 corpus/parse
+
+      - name: Fuzz expansion and arithmetic
+        run: ./fuzz_expand -max_total_time=120 -max_len=2048 -timeout=10 -close_fd_mask=3 corpus/expand
+
+      - name: Keep any crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+            oom-*
+
   alpine:
     name: Alpine (musl, real busybox ash)
     runs-on: ubuntu-latest
@@ -50,6 +137,9 @@ jobs:
 
       - name: Differential tests against Alpine's busybox ash
         run: tests/run_diff.sh ./acsh
+
+      - name: Interactive tests on a pty (as root, with /etc/acshrc and su)
+        run: make tests/pty/pty_test && tests/pty/pty_test ./acsh
 
       - name: Alpine's /etc/profile runs cleanly in a login shell
         run: |

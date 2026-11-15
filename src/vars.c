@@ -157,11 +157,18 @@ void var_restore(VarSave *s) {
     s->name = s->value = NULL;
 }
 
+/* PS1 and PS2 hold acsh prompt syntax (\g, $(...)); exported, they
+ * would show up garbled in any other shell started from acsh. They stay
+ * in this shell even after `export PS1`. */
+static int never_exported(const char *name) {
+    return strcmp(name, "PS1") == 0 || strcmp(name, "PS2") == 0;
+}
+
 char **var_environ(void) {
     size_t n = 0;
     for (int b = 0; b < NBUCKETS; b++) {
         for (Var *v = table[b]; v != NULL; v = v->next) {
-            if ((v->flags & V_EXPORT) && v->value != NULL) n++;
+            if ((v->flags & V_EXPORT) && v->value != NULL && !never_exported(v->name)) n++;
         }
     }
     char **env = malloc((n + 1) * sizeof(char *));
@@ -169,7 +176,7 @@ char **var_environ(void) {
     size_t k = 0;
     for (int b = 0; b < NBUCKETS; b++) {
         for (Var *v = table[b]; v != NULL; v = v->next) {
-            if (!(v->flags & V_EXPORT) || v->value == NULL) continue;
+            if (!(v->flags & V_EXPORT) || v->value == NULL || never_exported(v->name)) continue;
             size_t len = strlen(v->name) + strlen(v->value) + 2;
             env[k] = malloc(len);
             if (env[k] == NULL) continue;
@@ -220,4 +227,13 @@ void var_print(int which) {
         putchar('\n');
     }
     free(all);
+}
+
+/* Every variable that has a value, for Tab completion. */
+void var_each(void (*fn)(const char *name, void *ctx), void *ctx) {
+    for (int b = 0; b < NBUCKETS; b++) {
+        for (Var *v = table[b]; v != NULL; v = v->next) {
+            if (v->value != NULL) fn(v->name, ctx);
+        }
+    }
 }

@@ -90,3 +90,10 @@ int function_call(int argc, char *argv[]) {
     node_unref(body);
     return status;
 }
+
+/* Every function name, for Tab completion. */
+void function_each(void (*fn)(const char *name, void *ctx), void *ctx) {
+    for (int i = 0; i < ACSH_MAX_FUNCTIONS; i++) {
+        if (function_table[i].in_use) fn(function_table[i].name, ctx);
+    }
+}

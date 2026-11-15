@@ -28,7 +28,8 @@ typedef enum {
     R_APPEND,   /* [n]>>word   */
     R_RDWR,     /* [n]<>word   */
     R_DUP,      /* [n]<&word, [n]>&word ("-" closes n) */
-    R_HEREDOC   /* [n]<<word, [n]<<-word: target holds the body */
+    R_HEREDOC,  /* [n]<<word, [n]<<-word: target holds the body */
+    R_HERESTRING /* [n]<<<word (bash): the word, expanded, plus a newline */
 } RedirKind;
 
 typedef struct Redir {

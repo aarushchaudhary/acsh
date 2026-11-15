@@ -169,6 +169,10 @@ static int parse_primary(Test *t) {
 }
 
 static int parse_not(Test *t) {
+    if (stack_exhausted()) {
+        test_error(t, "%s", "test: expression nested too deeply");
+        return 0;
+    }
     const char *a = peek(t, 0);
     if (a != NULL && strcmp(a, "!") == 0 && peek(t, 1) != NULL) {
         t->pos++;

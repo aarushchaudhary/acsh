@@ -38,8 +38,8 @@ BusyBox `ash` exactly, or by section of `test_acsh.sh`, written `[N.N]`.
 | `ENV` (interactive shells only) | Yes | [2.28] |
 | `HOME`, `IFS` (reset at startup), `PATH` (ash's default when unset, [2.28]), `PWD`, `OLDPWD`, `PPID`, `LINENO`, `OPTIND`, `OPTARG`, `CDPATH` | Yes | `builtins_env`, `builtins_getopts`, `ash_extensions*` |
 | `PS2`, `PS4` | Yes | `set_options` (PS4), `ash_extensions2` (defaults); the PS2 prompt was checked by hand over a pty |
-| `PS1` | **No**: acsh prints a fixed `acsh:DIR$ ` prompt | — |
-| `HISTFILE`, `HISTSIZE` | **No**: history always goes to `~/.acsh_history` | [1.2] |
+| `PS1` (expanded each time; bash's `\u \h \w \$ …` escapes too) | Yes; never exported, so other shells never see acsh's prompt syntax | `tests/pty` (prompt) |
+| `HISTFILE`, `HISTSIZE` (plus bash's `HISTCONTROL`, `HISTIGNORE`) | Yes | [3.3] |
 | `LANG`, `LC_ALL`, `LC_CTYPE` | Partial: only `${#x}` counts UTF-8 characters; patterns and field splitting work on bytes, as in `ash` | `ash_extensions2` |
 
 ## Word expansions
@@ -53,7 +53,7 @@ BusyBox `ash` exactly, or by section of `test_acsh.sh`, written `[N.N]`.
 | Field splitting, including empty `IFS`, IFS whitespace vs other characters, and `"$@"` | Yes | `expand_split`, `posix_misc` |
 | Pathname expansion and `case` patterns, including `[!...]`, `[[:class:]]` and `set -f` | Yes | `posix_misc`, `glob_many`, `set_options`, [2.6] |
 | Quote removal | Yes | `grammar_quoting` |
-| Extensions: `${x:o:l}`, `${x/p/r}` (with `//`, `/#`, `/%`), `<(...)`, `>(...)`, `**` | Yes (not POSIX) | `ash_extensions*`, [2.25] |
+| Extensions: `${x:o:l}`, `${x/p/r}` (with `//`, `/#`, `/%`), `<(...)`, `>(...)`, `**`, brace expansion `{a,b}` `{1..5}` (off with `set +B`) | Yes (not POSIX) | `ash_extensions*`, [2.25], [3.6] |
 
 ## Redirection
 
@@ -63,7 +63,7 @@ BusyBox `ash` exactly, or by section of `test_acsh.sh`, written `[N.N]`.
 | Here-documents `<<` and `<<-`, with quoted and unquoted delimiters, several on one line | Yes | `heredocs` |
 | `set -C` (noclobber) | Yes | `set_options` |
 | File descriptors above 9 | **No**: rejected with an error | — |
-| Extensions: `&>`, `&>>` | Yes (not POSIX) | `ash_extensions2`, [2.27] |
+| Extensions: `&>`, `&>>`, `<<<` here-strings | Yes (not POSIX) | `ash_extensions2`, [2.27], [3.6] |
 
 ## Exit status and errors
 
@@ -123,12 +123,13 @@ times trap unset`: **Yes**, all present.
 - Their assignment and error rules are tested in `posix_misc`,
   `vars_scope` and `source_return`.
 
-`set` accepts the letters `-abefnuvxC` and these `-o` names:
-`allexport errexit ignoreeof monitor noclobber noexec noglob notify
-nounset pipefail verbose vi xtrace`.
+`set` accepts the letters `-abefnuvxBC` and these `-o` names:
+`allexport braceexpand errexit ignoreeof monitor noclobber noexec noglob
+notify nounset pipefail suggest verbose vi xtrace`.
 
-- `ignoreeof` and `vi` are accepted but do nothing yet; line editing
-  is the next phase.
+- `ignoreeof` works in the line editor (Ctrl-D does not exit). `vi`
+  is accepted but does nothing: the editor has emacs keys only.
+- `suggest` (acsh's own) shows history suggestions while typing.
 - `set -h` is not supported.
 
 ## Other utilities that must be builtins
@@ -145,5 +146,5 @@ nounset pipefail verbose vi xtrace`.
 | `read` (`-r`, plus `-d` from 2024 and the extensions `-p -t -n -s -u`) | Yes | `builtins_io` |
 | `type` | Yes | [1.6] |
 | `ulimit`, `umask` (octal, symbolic, `-S`) | Yes | `posix_misc`, `builtins_env` |
-| `fc` | **No**: line editing and history recall are the next phase | — |
+| `fc` (`-l -n -r -s -e`, `FCEDIT`) | Yes | [3.3] |
 | `newgrp` | Not a builtin; the system's `newgrp` runs | — |

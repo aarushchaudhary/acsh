@@ -316,7 +316,16 @@ static int apply_redirs(Redir *r, FdSave *save) {
         if (target == NULL) {
             return -1;
         }
-        if (r->kind == R_HEREDOC) {
+        if (r->kind == R_HERESTRING) {
+            /* <<<word: the expanded word and a newline, as a here-document */
+            size_t n = strlen(target);
+            char *body = realloc(target, n + 2);
+            if (body == NULL) { free(target); return -1; }
+            body[n] = '\n';
+            body[n + 1] = '\0';
+            target = body;
+        }
+        if (r->kind == R_HEREDOC || r->kind == R_HERESTRING) {
             int fd = heredoc_fd(target);
             free(target);
             if (fd < 0) {
@@ -353,7 +362,7 @@ static int apply_redirs(Redir *r, FdSave *save) {
             return -1;
         }
         switch (r->kind) {
-        case R_HEREDOC: break; /* handled above */
+        case R_HEREDOC: case R_HERESTRING: break; /* handled above */
         case R_IN:     flags = O_RDONLY; break;
         case R_OUT: case R_CLOBBER: flags = O_WRONLY | O_CREAT | O_TRUNC; break;
         case R_APPEND: flags = O_WRONLY | O_CREAT | O_APPEND; break;
@@ -458,6 +467,34 @@ static void trace(char **assigns, int nassigns, int from_vars, char **words, int
 static int run_simple(Node *n, int in_child, const char *text);
 static int exec_compound(Node *n);
 
+/* For a command that was not found: when it is a bash builtin (or a
+ * bash array assignment), what it is and what to use instead. */
+static const char *bash_only_hint(const char *name) {
+    static const struct { const char *name, *hint; } BASH[] = {
+        { "declare",   "declare is a bash builtin; use NAME=value, export NAME or readonly NAME" },
+        { "typeset",   "typeset is a bash/ksh builtin; use NAME=value, export NAME or readonly NAME" },
+        { "mapfile",   "mapfile is a bash builtin; use: while IFS= read -r line; do ...; done < file" },
+        { "readarray", "readarray is a bash builtin; use: while IFS= read -r line; do ...; done < file" },
+        { "coproc",    "coproc is a bash feature; use a background job and a named pipe (mkfifo)" },
+        { "shopt",     "shopt is a bash builtin; acsh has no shopt options (see set -o)" },
+        { "pushd",     "pushd is a bash builtin; use cd DIR, and cd - to go back" },
+        { "popd",      "popd is a bash builtin; use cd - to go back" },
+        { "dirs",      "dirs is a bash builtin; use pwd" },
+        { "disown",    "disown is a bash builtin; start the job with nohup instead" },
+        { "complete",  "complete is a bash builtin (programmable completion)" },
+        { "compgen",   "compgen is a bash builtin (programmable completion)" },
+        { NULL, NULL }
+    };
+    for (int i = 0; BASH[i].name != NULL; i++) {
+        if (strcmp(name, BASH[i].name) == 0) return BASH[i].hint;
+    }
+    const char *bracket = strchr(name, '[');
+    if (bracket != NULL && bracket != name && strstr(bracket, "]=") != NULL) {
+        return "arrays are a bash feature; use a space-separated list, or set -- a b c and $1 $2";
+    }
+    return NULL;
+}
+
 /* execvp() and its error, in a forked child. */
 static void exec_external_child(char **argv) {
     char **env = var_environ();
@@ -465,7 +502,9 @@ static void exec_external_child(char **argv) {
     execvp(argv[0], argv);
     int err = errno;
     if (err == ENOENT) {
-        shell_error("%s: command not found\n", argv[0]);
+        const char *hint = bash_only_hint(argv[0]);
+        if (hint != NULL) shell_error("%s: not found: %s\n", argv[0], hint);
+        else shell_error("%s: command not found\n", argv[0]);
         child_exit(127);
     }
     if (err == EACCES) {
@@ -553,6 +592,7 @@ static int run_job(Stage *stages, int n, const char *text, int background) {
         }
         if (pid == 0) {
             int tty = tty_fd;
+            free(pids);  /* the parent's bookkeeping; the child never uses it */
             child_setup_subshell();
             if (background && !jc) {
                 /* POSIX: without job control, an asynchronous command
@@ -965,6 +1005,50 @@ static int exec_compound(Node *n) {
 
 static int exec_node_inner(Node *n);
 
+/* a; b; c and a && b || c: the tree leans left as far as the list is
+ * long, so walk its spine in a loop instead of recursing. In an
+ * and-or list, everything but the last command is exempt from set -e. */
+static int run_list(Node *n) {
+    size_t count = 0, cap = 16;
+    Node **spine = malloc(cap * sizeof(Node *));
+    if (spine == NULL) {
+        shell_error("out of memory\n");
+        return 1;
+    }
+    NodeKind kind = n->kind;
+    Node *base = n;
+    while (base->kind == kind || (kind != N_SEQ && (base->kind == N_AND || base->kind == N_OR))) {
+        if (count == cap) {
+            Node **bigger = realloc(spine, (cap *= 2) * sizeof(Node *));
+            if (bigger == NULL) { free(spine); shell_error("out of memory\n"); return 1; }
+            spine = bigger;
+        }
+        spine[count++] = base;   /* outermost first */
+        base = base->u.bin.left;
+    }
+    int status;
+    if (kind == N_SEQ) {
+        status = exec_node(base);
+        for (size_t i = count; i-- > 0 && !control_flow_unwinding();) {
+            status = exec_node(spine[i]->u.bin.right);
+        }
+        free(spine);
+        return status;
+    }
+    errexit_off++;
+    status = exec_node(base);
+    errexit_off--;
+    for (size_t i = count; i-- > 0 && !control_flow_unwinding();) {
+        if ((spine[i]->kind == N_AND) == (status == 0)) {
+            if (i > 0) errexit_off++;   /* not the last: still on the left of an && or || */
+            status = exec_node(spine[i]->u.bin.right);
+            if (i > 0) errexit_off--;
+        }
+    }
+    free(spine);
+    return status;
+}
+
 /* Runs n; pipes of <(...) and >(...) it opened close when it is done. */
 int exec_node(Node *n) {
     if (shell_option('n') && !shell_is_interactive()) {
@@ -980,22 +1064,17 @@ static int exec_node_inner(Node *n) {
     if (n == NULL) {
         return 0;
     }
+    if (stack_exhausted()) {
+        shell_error("commands are nested too deeply (eval, source or functions)\n");
+        env_set_last_status(2);
+        return 2;
+    }
     int status;
     switch (n->kind) {
     case N_SEQ:
-        status = exec_node(n->u.bin.left);
-        if (control_flow_unwinding()) return status;
-        return exec_node(n->u.bin.right);
     case N_AND:
     case N_OR:
-        errexit_off++;
-        status = exec_node(n->u.bin.left);
-        errexit_off--;
-        if (control_flow_unwinding()) return status;
-        if ((n->kind == N_AND) == (status == 0)) {
-            status = exec_node(n->u.bin.right);
-        }
-        return status;
+        return run_list(n);
     case N_BACKGROUND:
         return run_background(n);
     case N_PIPELINE:

@@ -21,16 +21,6 @@ void shell_mark_subshell(void) {
     interactive = 0;
 }
 
-/* PS1. Kept in its own function so it can become configurable later. */
-static void print_prompt(void) {
-    char cwd[1024];
-    /* prompts go to stderr, as in ash, so stdout carries only output */
-    if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        fprintf(stderr, "acsh:%s$ ", cwd);
-    } else {
-        fprintf(stderr, "acsh$ ");
-    }
-}
 
 /* Reads input lines straight from a file descriptor through acsh's own
  * buffer. stdio is not used for shell input: a forked child that
@@ -96,14 +86,33 @@ static char *stdin_lines(void *ctx, int continuation) {
     if (!interactive) {
         return echo_if_verbose(reader_line(&stdin_reader));
     }
+    if (continuation && shell_interrupted()) {
+        return NULL;  /* Ctrl-C cancelled this command: no more lines for it */
+    }
     if (!continuation) {
         jobs_report_changes();
-        print_prompt();
-    } else {
-        const char *ps2 = var_get("PS2");
-        fputs(ps2 != NULL ? ps2 : "> ", stderr);
     }
-    char *line = echo_if_verbose(reader_line(&stdin_reader));
+    char *line;
+    if (lineedit_usable()) {
+        char *ps = prompt_string(continuation ? "PS2" : "PS1");
+        line = lineedit_read(ps);
+        free(ps);
+        if (line != NULL && line[0] == '\0') {
+            /* Ctrl-C: the line is dropped; a command already begun on
+             * earlier lines is cancelled too (main loop) */
+            free(line);
+            env_set_last_status(130);
+            if (continuation) {
+                shell_note_sigint();
+                return NULL;
+            }
+            line = strdup("\n");
+        }
+        line = echo_if_verbose(line);
+    } else {
+        prompt_print(continuation ? "PS2" : "PS1");
+        line = echo_if_verbose(reader_line(&stdin_reader));
+    }
     if (line == NULL) {
         return NULL;
     }
@@ -112,13 +121,11 @@ static char *stdin_lines(void *ctx, int continuation) {
         shell_clear_interrupted();
     }
     size_t len = strcspn(line, "\n");
-    if (len > 0) {
-        char *entry = strndup(line, len);
-        if (entry != NULL) {
-            history_add(entry);
-            history_save_append();
-            free(entry);
-        }
+    char *entry = strndup(line, len);
+    if (entry != NULL) {
+        if (continuation) history_continue(entry);
+        else history_begin(entry);
+        free(entry);
     }
     return line;
 }
@@ -223,36 +230,63 @@ static int run_file(const char *path, int errors_end_shell) {
     return finish_run(r);
 }
 
+static void run_startup_file(const char *path);
+
 /* A login shell (-l, or argv[0] starting with '-', as login(1) starts
  * it) reads /etc/profile and then ~/.profile, as ash does. On Alpine,
  * /etc/profile itself runs /etc/profile.d/[*].sh. */
 static void load_login_profiles(void) {
     if (access("/etc/profile", R_OK) == 0) {
-        run_file("/etc/profile", 0);
+        run_startup_file("/etc/profile");
     }
     const char *home = var_get("HOME");
     if (home != NULL) {
         char path[4096];
         snprintf(path, sizeof(path), "%s/.profile", home);
         if (access(path, R_OK) == 0) {
-            run_file(path, 0);
+            run_startup_file(path);
         }
     }
 }
 
 
-/* Runs ~/.acshrc at startup if it exists, so a fresh install is useful
- * without the ENV workaround ash needs. */
-static void load_rc_file(void) {
+/* Files already run at startup, by device and inode: ENV=~/.acshrc,
+ * or a ~/.profile that sources ~/.acshrc, must not run it twice. */
+static struct { dev_t dev; ino_t ino; } startup_seen[8];
+static int nstartup_seen = 0;
+
+static void run_startup_file(const char *path) {
+    struct stat st;
+    if (path == NULL || *path == '\0' || stat(path, &st) != 0 || access(path, R_OK) != 0) return;
+    for (int i = 0; i < nstartup_seen; i++) {
+        if (startup_seen[i].dev == st.st_dev && startup_seen[i].ino == st.st_ino) return;
+    }
+    if (nstartup_seen < 8) {
+        startup_seen[nstartup_seen].dev = st.st_dev;
+        startup_seen[nstartup_seen++].ino = st.st_ino;
+    }
+    run_file(path, 0);
+}
+
+/* What an interactive shell reads, login or not (so `su`, `docker exec
+ * -it` and `lxc exec` shells get the same aliases): /etc/acshrc, then
+ * ~/.acshrc, then $ENV (expanded, as POSIX asks). Scripts and -c read
+ * none of them. A setuid shell reads none either. */
+static void load_interactive_startup(void) {
+    if (getuid() != geteuid() || getgid() != getegid()) return;
+    run_startup_file("/etc/acshrc");
     const char *home = var_get("HOME");
-    if (home == NULL) {
-        return;
+    if (home != NULL && *home) {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/.acshrc", home);
+        run_startup_file(path);
     }
-    char path[512];
-    snprintf(path, sizeof(path), "%s/.acshrc", home);
-    if (access(path, R_OK) == 0) {
-        run_file(path, 0);
-    }
+    const char *env = var_get("ENV");
+    char *marked = (env != NULL && *env) ? lex_mark(env, 1) : NULL;
+    char *file = marked != NULL ? expand_string(marked, 0) : NULL;
+    run_startup_file(file);
+    free(file);
+    free(marked);
 }
 
 static void usage_error(const char *fmt, const char *arg) {
@@ -271,6 +305,7 @@ static void usage_error(const char *fmt, const char *arg) {
  * aliases, ~/.acshrc) when -i is given, or when no -c or FILE is given
  * and stdin and stderr are terminals. */
 int main(int argc, char *argv[]) {
+    stack_init(&argc);
     vars_init();
     {
         char buf[32];
@@ -291,6 +326,7 @@ int main(int argc, char *argv[]) {
         if (var_get("PS2") == NULL) var_set("PS2", "> ");
         if (var_get("PS4") == NULL) var_set("PS4", "+ ");
         var_set("OPTIND", "1");
+        shell_set_option('B', 1); /* brace expansion, as in bash; set +B turns it off */
         if (var_get("PATH") == NULL) {
             var_set("PATH", "/sbin:/usr/sbin:/bin:/usr/bin"); /* ash's default, exported */
             var_add_flags("PATH", V_EXPORT);
@@ -359,14 +395,8 @@ int main(int argc, char *argv[]) {
     if (login) {
         load_login_profiles();
     }
-    if (interactive && getuid() == geteuid() && getgid() == getegid()) {
-        /* POSIX: an interactive shell expands $ENV and runs that file */
-        const char *env = var_get("ENV");
-        char *marked = (env != NULL && *env) ? lex_mark(env, 1) : NULL;
-        char *file = marked != NULL ? expand_string(marked, 0) : NULL;
-        if (file != NULL && *file && access(file, R_OK) == 0) run_file(file, 0);
-        free(file);
-        free(marked);
+    if (interactive) {
+        load_interactive_startup();
     }
 
     if (command != NULL) {
@@ -386,9 +416,6 @@ int main(int argc, char *argv[]) {
 
     /* standard input */
     if (interactive) {
-        /* the interactive conveniences; never for scripts, which must
-         * behave the same for everyone */
-        load_rc_file();
         history_load();
     }
     Lexer *lx = lexer_new("", stdin_lines, NULL, interactive ? NULL : "stdin");
@@ -397,10 +424,13 @@ int main(int argc, char *argv[]) {
         if (r == 0) {
             break; /* Ctrl+D / end of input */
         }
-        if (r == -2 && interactive) {
-            /* Ctrl+C stopped a command: drop the rest of what was typed */
+        if ((r == -2 || shell_interrupted()) && interactive) {
+            /* Ctrl+C stopped a command, or cancelled one being typed:
+             * drop the rest of what was typed */
             shell_clear_interrupted();
             lex_discard_input(lx);
+            env_set_last_status(130);
+            continue;
         }
         finish_run(r);
     }

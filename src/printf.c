@@ -109,6 +109,60 @@ static double float_arg(const char *s, int *status) {
     return v;
 }
 
+/* %q: as bash quotes. Empty is ''; a string with control characters
+ * becomes $'...' with escapes; otherwise each character the shell would
+ * treat specially gets a backslash (~ and # only at the start). */
+static char *shell_quote(const char *s) {
+    size_t n = strlen(s);
+    char *out = malloc(n * 4 + 4);
+    size_t k = 0;
+    if (n == 0) {
+        strcpy(out, "''");
+        return out;
+    }
+    int control = 0;
+    for (const unsigned char *c = (const unsigned char *)s; *c; c++) {
+        if (*c < 0x20 || *c == 0x7f) control = 1;
+    }
+    if (control) {
+        out[k++] = '$';
+        out[k++] = '\'';
+        for (const unsigned char *c = (const unsigned char *)s; *c; c++) {
+            const char *e = NULL;
+            switch (*c) {
+            case '\t': e = "\\t"; break;
+            case '\n': e = "\\n"; break;
+            case '\r': e = "\\r"; break;
+            case '\a': e = "\\a"; break;
+            case '\b': e = "\\b"; break;
+            case '\f': e = "\\f"; break;
+            case '\v': e = "\\v"; break;
+            case 0x1b: e = "\\E"; break;
+            case '\\': e = "\\\\"; break;
+            case '\'': e = "\\'"; break;
+            }
+            if (e != NULL) {
+                while (*e) out[k++] = *e++;
+            } else if (*c < 0x20 || *c == 0x7f) {
+                k += (size_t)sprintf(out + k, "\\%03o", *c);
+            } else {
+                out[k++] = (char)*c;
+            }
+        }
+        out[k++] = '\'';
+        out[k] = '\0';
+        return out;
+    }
+    for (const char *c = s; *c; c++) {
+        if (strchr(" '\"$*?\\;&()|<>!{}[]^,`", *c) || ((*c == '~' || *c == '#') && c == s)) {
+            out[k++] = '\\';
+        }
+        out[k++] = *c;
+    }
+    out[k] = '\0';
+    return out;
+}
+
 /* printf FORMAT [ARG...]: the format is reused while arguments remain. */
 int builtin_printf(Command *cmd) {
     if (cmd->argc < 2) {
@@ -159,8 +213,8 @@ int builtin_printf(Command *cmd) {
                 }
             }
             char conv = *f;
-            if (conv == '\0' || strchr("diouxXcsbfeEgG", conv) == NULL) {
-                /* ash refuses anything else, e.g. %q or %z */
+            if (conv == '\0' || strchr("diouxXcsbfeEgGq", conv) == NULL) {
+                /* anything else, e.g. %z, is refused (as ash does) */
                 const char *end = conv ? f + 1 : f;
                 fflush(stdout);
                 shell_error("printf: %.*s: invalid format\n", (int)(end - start), start);
@@ -190,6 +244,14 @@ int builtin_printf(Command *cmd) {
                 spec[k++] = 's'; spec[k] = '\0';
                 printf(spec, arg ? arg : "");
                 break;
+            case 'q': {
+                /* bash's %q: the argument quoted so the shell reads it back as is */
+                char *q = shell_quote(arg ? arg : "");
+                spec[k++] = 's'; spec[k] = '\0';
+                printf(spec, q);
+                free(q);
+                break;
+            }
             case 'b': {
                 /* the argument's escapes are interpreted, as by echo -e */
                 const char *s = arg ? arg : "";

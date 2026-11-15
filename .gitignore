@@ -1,3 +1,32 @@
+# build outputs (make, make static, make fuzz, make check)
+/acsh
+/acsh-static
+/fuzz_parse
+/fuzz_expand
+/.build-flags
+/tests/pty/pty_test
+*.o
+
+# local startup file
 .acshrc
-acsh
-acsh-static
+
+# fuzzing: the corpus CI builds and any inputs libFuzzer saves
+/corpus/
+crash-*
+leak-*
+timeout-*
+oom-*
+slow-unit-*
+
+# files CI jobs write in the checkout
+/full.stripped
+/minimal.stripped
+/profile.err
+
+# profiling, core dumps, editors (clangd keeps its index in .cache)
+gmon.out
+core
+core.*
+.cache/
+*.swp
+*~

@@ -9,7 +9,7 @@ typedef enum {
     T_WORD, T_IO_NUMBER, T_NEWLINE, T_EOF,
     T_SEMI, T_AMP, T_PIPE, T_AND_IF, T_OR_IF, T_DSEMI, T_LPAREN, T_RPAREN,
     T_LESS, T_GREAT, T_DGREAT, T_LESSAND, T_GREATAND, T_LESSGREAT, T_CLOBBER,
-    T_DLESS, T_DLESSDASH, T_ANDGREAT, T_ANDDGREAT, T_SEMIAND
+    T_DLESS, T_DLESSDASH, T_ANDGREAT, T_ANDDGREAT, T_SEMIAND, T_TLESS
 } TokType;
 
 typedef struct {
@@ -31,6 +31,8 @@ struct Lexer {
     int        alias_blank;  /* that alias ended in a blank: the word after it is checked too */
     struct { char *name; size_t end; } active[16]; /* aliases whose text is still being read */
     int        nactive;
+    size_t     line_pos;     /* lex_line_at cache: buf[0, line_pos) holds line_count newlines */
+    int        line_count;
     int        base_line;    /* lines already dropped from the front of buf */
     char      *name;         /* for error messages; NULL at the prompt */
     struct PendingDoc *docs; /* here-documents whose bodies start after the next newline */

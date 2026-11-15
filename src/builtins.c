@@ -425,10 +425,6 @@ static int builtin_unalias(Command *cmd) {
     return 0;
 }
 
-static int builtin_history(void) {
-    history_print_all();
-    return 0;
-}
 
 /* `read VAR1 VAR2 ... VARN` reads one line from stdin, splits it on
  * whitespace, and assigns the first N-1 words to VAR1..VAR(N-1) with
@@ -760,13 +756,13 @@ static int builtin_trap(Command *cmd) {
  * ash's order. Letters P (pipefail), I, b, E and V are internal: they
  * have no short form. Behavior lives where each is checked: e, x, P, C
  * in exec.c; u, f in expand.c; a in vars.c; n, v in main.c. */
-#define SET_OPTIONS "abefnuvxC"
+#define SET_OPTIONS "abefnuvxBC"
 
 static const struct { const char *name; char letter; } LONG_OPTIONS[] = {
     { "errexit", 'e' }, { "noglob", 'f' }, { "ignoreeof", 'I' }, { "monitor", 'm' },
     { "noexec", 'n' }, { "xtrace", 'x' }, { "verbose", 'v' }, { "noclobber", 'C' },
     { "allexport", 'a' }, { "notify", 'b' }, { "nounset", 'u' }, { "errtrace", 'E' },
-    { "vi", 'V' }, { "pipefail", 'P' }, { NULL, 0 }
+    { "vi", 'V' }, { "pipefail", 'P' }, { "braceexpand", 'B' }, { "suggest", 'S' }, { NULL, 0 }
 };
 
 /* set -o: "name   on/off"; set +o: commands that recreate the settings. */
@@ -1455,7 +1451,8 @@ static int builtin_let(Command *cmd) {
 
 static int builtin_break(Command *cmd)    { return builtin_break_or_continue(cmd, 0); }
 static int builtin_continue(Command *cmd) { return builtin_break_or_continue(cmd, 1); }
-static int builtin_history_cmd(Command *cmd) { (void)cmd; return builtin_history(); }
+static int builtin_history_cmd(Command *cmd) { return history_builtin(cmd->argc, cmd->argv); }
+static int builtin_fc(Command *cmd) { return fc_builtin(cmd->argc, cmd->argv); }
 
 /* Every builtin, once: dispatch, `type`, `command -v` and `hash` all
  * use this table. */
@@ -1466,7 +1463,7 @@ static const struct { const char *name; int (*run)(Command *); } BUILTINS[] = {
     { "alias", builtin_alias }, { "bg", builtin_bg }, { "break", builtin_break },
     { "cd", builtin_cd }, { "chdir", builtin_cd }, { "command", builtin_command }, { "continue", builtin_continue },
     { "echo", builtin_echo }, { "eval", builtin_eval }, { "exec", builtin_exec },
-    { "exit", builtin_exit }, { "export", builtin_export }, { "false", builtin_false },
+    { "exit", builtin_exit }, { "export", builtin_export }, { "false", builtin_false }, { "fc", builtin_fc },
     { "fg", builtin_fg }, { "getopts", builtin_getopts }, { "hash", builtin_hash },
     { "help", builtin_help },
     { "history", builtin_history_cmd }, { "jobs", builtin_jobs }, { "kill", builtin_kill },
@@ -1502,6 +1499,11 @@ static int (*find_builtin(const char *name))(Command *) {
         if (strcmp(BUILTINS[i].name, name) == 0) return BUILTINS[i].run;
     }
     return NULL;
+}
+
+/* Every builtin name, for Tab completion. */
+void builtin_each(void (*fn)(const char *name, void *ctx), void *ctx) {
+    for (int i = 0; BUILTINS[i].name != NULL; i++) fn(BUILTINS[i].name, ctx);
 }
 
 int is_builtin_name(const char *name) {

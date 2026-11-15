@@ -57,7 +57,7 @@ static int fill(Lexer *lx) {
     char *line = lx->source(lx->ctx, !lx->new_command);
     lx->new_command = 0;
     if (line == NULL) {
-        lx->at_eof = 1;
+        if (!shell_interrupted()) lx->at_eof = 1;  /* else Ctrl-C cancelled a line: not the end */
         return 0;
     }
     append(lx, line);
@@ -116,6 +116,8 @@ void lex_begin_command(Lexer *lx) {
     lx->len -= lx->pos;
     lx->pos = 0;
     lx->alias_end = 0;
+    lx->line_pos = 0;
+    lx->line_count = 0;
     lx->alias_blank = 0;
     drop_active_aliases(lx, (size_t)-1);
     lx->new_command = 1;
@@ -132,6 +134,7 @@ static void drop_heredocs(Lexer *lx) {
 
 void lex_discard(Lexer *lx) {
     lx->pos = lx->len;
+    lx->new_command = 1;  /* what comes next starts a new command (PS1, not PS2) */
     drop_heredocs(lx); /* their redirections were freed with the failed command */
 }
 
@@ -140,11 +143,17 @@ void lex_discard_input(Lexer *lx) {
 }
 
 int lex_line_at(Lexer *lx, size_t pos) {
-    int line = lx->base_line + 1;
-    for (size_t i = 0; i < pos && i < lx->len; i++) {
-        if (lx->buf[i] == '\n') line++;
+    if (pos > lx->len) pos = lx->len;
+    if (pos < lx->line_pos) {         /* behind the cache (text was replaced): recount */
+        lx->line_pos = 0;
+        lx->line_count = 0;
     }
-    return line;
+    /* count only the new part: a long script stays linear */
+    for (size_t i = lx->line_pos; i < pos; i++) {
+        if (lx->buf[i] == '\n') lx->line_count++;
+    }
+    lx->line_pos = pos;
+    return lx->base_line + 1 + lx->line_count;
 }
 
 char *lex_source(Lexer *lx, size_t start, size_t end) {
@@ -153,6 +162,9 @@ char *lex_source(Lexer *lx, size_t start, size_t end) {
 
 void lex_syntax_error(Lexer *lx, size_t pos, const char *usage, const char *fmt, ...) {
     va_list ap;
+    if (shell_interrupted()) {
+        return;   /* Ctrl-C cancelled the command being typed: no error to report */
+    }
     if (lx->name != NULL) {
         int line = lx->base_line + 1;
         for (size_t i = 0; i < pos && i < lx->len; i++) {
@@ -306,6 +318,10 @@ static int copy_paren_subst(Lexer *lx, Str *out, size_t start) {
         } else if (paren_scan(&ps, c)) {
             return 0;
         }
+        if (ps.depth > ACSH_MAX_NESTING) {
+            lex_syntax_error(lx, start, NULL, "parentheses nested more than %d deep", ACSH_MAX_NESTING);
+            return -1;
+        }
     }
 }
 
@@ -326,8 +342,9 @@ static int copy_brace_param(Lexer *lx, Str *out, size_t start) {
         if (c == '\\' && ch(lx, 0) != END) {
             put(out, (char)ch(lx, 0));
             lx->pos++;
-        } else if (c == '{') {
-            depth++;
+        } else if (c == '{' && ++depth > ACSH_MAX_NESTING) {
+            lex_syntax_error(lx, start, NULL, "${...} nested more than %d deep", ACSH_MAX_NESTING);
+            return -1;
         } else if (c == '}' && --depth == 0) {
             return 0;
         }
@@ -722,7 +739,7 @@ int lex_next(Lexer *lx, Token *t) {
         size_t n = 0;
         while (isdigit(ch(lx, n))) n++;
         int after = ch(lx, n);
-        if (after == '<' || after == '>') {
+        if ((after == '<' || after == '>') && ch(lx, n + 1) != '(') { /* 4<(cmd) is a word */
             t->type = T_IO_NUMBER;
             t->text = strndup(lx->buf + lx->pos, n);
             lx->pos += n;
@@ -765,7 +782,8 @@ int lex_next(Lexer *lx, Token *t) {
     case '(':  t->type = T_LPAREN; break;
     case ')':  t->type = T_RPAREN; break;
     case '<':
-        if (d == '<' && e == '-') { t->type = T_DLESSDASH; len = 3; }
+        if (d == '<' && e == '<') { t->type = T_TLESS; len = 3; }          /* <<< here-string */
+        else if (d == '<' && e == '-') { t->type = T_DLESSDASH; len = 3; }
         else if (d == '<') { t->type = T_DLESS; len = 2; }
         else if (d == '&') { t->type = T_LESSAND; len = 2; }
         else if (d == '>') { t->type = T_LESSGREAT; len = 2; }
@@ -813,6 +831,10 @@ int lex_expand_alias(Lexer *lx, const Token *t) {
     }
     lx->len = t->start;
     lx->buf[lx->len] = '\0';
+    if (lx->line_pos > t->start) {    /* the text after start changes */
+        lx->line_pos = 0;
+        lx->line_count = 0;
+    }
     append(lx, value);
     size_t vlen = strlen(value);
     size_t delta = vlen - (t->end - t->start); /* wraps when shrinking; adds back correctly */

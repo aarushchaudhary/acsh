@@ -527,6 +527,97 @@ RESULT=$(./acsh -c 'trap "" INT; sh -c "kill -INT \$\$; echo survived"')
 check_eq "trap '' INT is inherited by commands" "survived" "$RESULT"
 
 echo ""
+echo "[3.1] No crash on hostile input (deep nesting, huge values, overflow)"
+deep() { # deep NAME OPEN CLOSE MIDDLE: a 100,000-deep script, run; prints the exit status
+    o=$(head -c 100000 /dev/zero | tr '\0' "$2")
+    c=$(head -c 100000 /dev/zero | tr '\0' "$3")
+    printf '%s%s%s\n' "$o" "$4" "$c" > /tmp/acsh_deep_$1.sh
+    ./acsh /tmp/acsh_deep_$1.sh >/dev/null 2>&1
+    echo $?
+    rm -f /tmp/acsh_deep_$1.sh
+}
+check_eq "100,000 nested ( ) is a syntax error, not a crash" "2" "$(deep paren '(' ')' 'echo x')"
+check_eq "100,000 nested \$( ) is a syntax error, not a crash" "2" "$(deep subst '$' ')' '(echo x')"
+check_eq "100,000 nested arithmetic ( ) is an error, not a crash" "2" "$(deep arith '(' ')' 'echo $((1')"
+printf 'true' > /tmp/acsh_deep_ao.sh
+head -c 100000 /dev/zero | tr '\0' '&' | sed 's/&&/ \&\& true/g' >> /tmp/acsh_deep_ao.sh
+printf '; echo andor-ok\n' >> /tmp/acsh_deep_ao.sh
+check_eq "a 50,000-long && list runs" "andor-ok" "$(./acsh /tmp/acsh_deep_ao.sh 2>&1)"
+rm -f /tmp/acsh_deep_ao.sh
+./acsh -c 'e="eval \"\$e\""; eval "$e"' 2>/dev/null
+check_eq "endless eval recursion ends the script with status 2" "2" "$?"
+RESULT=$(./acsh -c 'x=$(head -c 1048576 /dev/zero | tr "\0" a); z=${x//a/bb}; IFS=a; set -- $x; echo ${#z} $#')
+check_eq "a 1 MB value: replace all and split, quickly" "2097152 1048576" "$RESULT"
+RESULT=$(./acsh -c 'echo $(( (-9223372036854775807-1) / -1 )) $((9223372036854775807+1)) $((3**9223372036854775807))' 2>&1)
+check_eq "arithmetic overflow wraps (no SIGFPE)" "-9223372036854775808 -9223372036854775808 -6148914691236517205" "$RESULT"
+# CVE-2022-48174 was an ash arithmetic overflow; these are its kind of input
+printf 'echo $((%s1))\n' "$(head -c 200000 /dev/zero | tr '\0' '!')" > /tmp/acsh_cve.sh
+./acsh /tmp/acsh_cve.sh >/dev/null 2>&1
+check_eq "200,000 nested ! in arithmetic: an error, not a crash" "2" "$?"
+printf 'echo $((%s1))\n' "$(head -c 100000 /dev/zero | tr '\0' 'x' | sed 's/x/a=/g')" > /tmp/acsh_cve.sh
+./acsh /tmp/acsh_cve.sh >/dev/null 2>&1
+check_eq "a 100,000-long a=a=...=1 chain: an error, not a crash (ash segfaults)" "2" "$?"
+printf 'x="%s1"; echo $((x))\n' "$(head -c 100000 /dev/zero | tr '\0' 'x' | sed 's/x/1+/g')" > /tmp/acsh_cve.sh
+check_eq "a 100,001-term sum inside a variable" "100001" "$(./acsh /tmp/acsh_cve.sh 2>&1)"
+rm -f /tmp/acsh_cve.sh
+RESULT=$(./acsh -c 'f() { f; }; f; echo "status $?"' 2>/dev/null)
+check_eq "endless function recursion stops with an error" "status 1" "$RESULT"
+
+echo ""
+echo "[3.3] History: HISTCONTROL, HISTIGNORE, multi-line entries, locking, fc"
+HDIR=/tmp/acsh_hist_test; rm -rf $HDIR; mkdir -p $HDIR
+printf 'echo one\n mc-injected-cmd\nHISTIGNORE="ls*:&"\nls -a\necho two\necho two\nif true\nthen echo multi\nfi\n' | HOME=$HDIR ./acsh -i >/dev/null 2>&1
+check_eq "a line starting with a space is not kept (default ignoreboth)" "0" "$(grep -c mc-injected $HDIR/.acsh_history)"
+check_eq "HISTIGNORE patterns never reach the file" "0" "$(grep -c '^ls' $HDIR/.acsh_history)"
+check_eq "repeated commands are kept once" "1" "$(grep -c '^echo two$' $HDIR/.acsh_history)"
+check_eq "a multi-line command is one entry (backslash-continued in the file)" "if true\\" "$(grep '^if' $HDIR/.acsh_history)"
+RESULT=$(printf 'history 2>/dev/null\n' | HOME=$HDIR ./acsh -i 2>/dev/null | grep -c 'then echo multi')
+check_eq "history prints to stdout, multi-line entry intact after reload" "1" "$RESULT"
+RESULT=$(printf 'echo hello world\nfc -s hello=bye\n' | HOME=$HDIR ./acsh -i 2>/dev/null | tail -1)
+check_eq "fc -s OLD=NEW runs the edited command" "bye world" "$RESULT"
+RESULT=$(printf 'echo a1\necho a2\nfc -ln -2\n' | HOME=$HDIR ./acsh -i 2>/dev/null | tail -2 | tr '\n' ' ')
+check_eq "fc -l lists the last entries" "echo a1 echo a2 " "$RESULT"
+rm -f $HDIR/.acsh_history
+seq 1 300 | sed 's/^/echo A/' | HOME=$HDIR ./acsh -i >/dev/null 2>&1 &
+seq 1 300 | sed 's/^/echo B/' | HOME=$HDIR ./acsh -i >/dev/null 2>&1
+wait
+check_eq "two shells writing at once leave 600 clean entries" "600 0" "$(wc -l < $HDIR/.acsh_history | tr -d ' ') $(grep -cv '^echo [AB][0-9]*$' $HDIR/.acsh_history)"
+seq 1 30 | sed 's/^/echo n/' | HOME=$HDIR HISTSIZE=10 ./acsh -i >/dev/null 2>&1
+check_eq "the file is trimmed to HISTSIZE" "10" "$(wc -l < $HDIR/.acsh_history | tr -d ' ')"
+printf 'echo nofile\n' | HOME=$HDIR HISTFILE= ./acsh -i >/dev/null 2>&1
+check_eq "HISTFILE= keeps no file" "0" "$(grep -c nofile $HDIR/.acsh_history)"
+rm -rf $HDIR
+
+echo ""
+echo "[3.5] Bash-only syntax gets a message naming the feature and the alternative"
+hint() { ./acsh -c "$1" 2>&1 | grep -c "$2"; }
+check_eq "a=(1 2): arrays, use a space-separated list" "1" "$(hint 'a=(1 2)' 'arrays are a bash feature; use a space-separated list')"
+check_eq "\${a[1]}: arrays" "1" "$(hint 'echo ${a[1]}' 'arrays are a bash feature')"
+check_eq "a[1]=x: arrays" "1" "$(hint 'a[1]=x' 'arrays are a bash feature')"
+check_eq "select: use while and read" "1" "$(hint 'select x in a b; do break; done' 'select is a bash feature; use a while loop with read')"
+check_eq "declare: use NAME=value, export, readonly" "1" "$(hint 'declare -i n=1' 'declare is a bash builtin; use NAME=value')"
+check_eq "mapfile: use while read" "1" "$(hint 'mapfile x </dev/null' 'mapfile is a bash builtin; use: while IFS= read -r line')"
+check_eq "coproc: use a background job and mkfifo" "1" "$(hint 'coproc cat' 'coproc is a bash feature')"
+check_eq "\${x^^}: use tr" "1" "$(hint 'x=a; echo ${x^^}' 'case changing is a bash feature; use tr')"
+check_eq "\${!x}: use eval" "1" "$(hint 'x=y; echo ${!x}' 'indirection')"
+
+echo ""
+echo "[3.6] Bash extras: here-strings, brace expansion, printf %q (checked against bash)"
+RESULT=$(read -r a b <<< "one two three"; echo "[$a][$b]")
+check_eq "<<< feeds a word to read" "[one][two three]" "$RESULT"
+x="a  b"
+check_eq "<<< \"\$x\" keeps the spaces" "a  b" "$(cat <<< "$x")"
+check_eq "{a,b,c} and nesting" "xay xby xcy" "$(echo x{a,{b,c}}y)"
+check_eq "{1..10..3} and padded {01..03}" "1 4 7 10 01 02 03" "$(echo {1..10..3} {01..03})"
+check_eq "{a..e} and {e..a..2}" "a b c d e e c a" "$(echo {a..e} {e..a..2})"
+check_eq "quoted braces, {a} and {} stay literal" "{a,b} {a} {}" "$(echo "{a,b}" {a} {})"
+check_eq "assignments are not brace-expanded" "{a,b}" "$(v={a,b}; echo $v)"
+check_eq "set +B turns brace expansion off" "{a,b}" "$(set +B; echo {a,b})"
+check_eq "printf %q quotes as bash does" "a\\ b it\\'s \\\$x '' \$'t\\tx'" "$(printf '%q ' 'a b' "it's" '$x' '' "$(printf 't\tx')" | sed 's/ $//')"
+RESULT=$(eval "y=$(printf %q "a b \$c 'd'")"; echo "$y")
+check_eq "printf %q output reads back unchanged" "a b \$c 'd'" "$RESULT"
+
+echo ""
 echo "=================================================="
 echo " Summary"
 echo "=================================================="
