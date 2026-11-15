@@ -13,6 +13,7 @@ BIN=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 MIN=$2
 repo=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
+chmod 755 "$work"   # readable by others: the su test runs acsh as nobody
 trap 'rm -rf "$work"' EXIT
 cp -r "$repo/tests" "$repo/test_acsh.sh" "$repo/config" "$work/"
 cp "$BIN" "$work/acsh"

@@ -13,17 +13,12 @@
 
 RUNS=${RUNS:-1000}
 results=$(mktemp)
-trap 'rm -f "$results"' EXIT
 
-# nanoseconds now; a date without %N (some busybox builds) falls back to
-# /proc/uptime, which counts in hundredths of a second
-ns() {
-    t=$(date +%s%N 2>/dev/null)
-    case $t in
-    *N* | "") awk '{ printf "%.0f\n", $1 * 1000000000 }' /proc/uptime ;;
-    *) echo "$t" ;;
-    esac
-}
+# the timer: a small C program, built here (cc is needed anyway)
+here=$(cd "$(dirname "$0")" && pwd)
+runs=$(mktemp)
+cc -O2 -o "$runs" "$here/runs.c" || exit 2
+trap 'rm -f "$results" "$runs"' EXIT
 
 printf '%-10s %10s %10s %14s\n' shell "size (B)" "RSS (KB)" "${RUNS}x -c true"
 for spec in "$@"; do
@@ -33,13 +28,7 @@ for spec in "$@"; do
     size=$(wc -c < "$bin" | tr -d ' ')
     # the shell's own idle footprint: builtins only, no child processes
     rss=$($cmd -c 'while read -r k v u; do [ "$k" = VmRSS: ] && echo "$v"; done < /proc/$$/status')
-    start=$(ns)
-    i=0
-    while [ $i -lt "$RUNS" ]; do
-        $cmd -c true
-        i=$((i + 1))
-    done
-    ms=$(( ($(ns) - start) / 1000000 ))
+    ms=$("$runs" "$RUNS" $cmd -c true) || exit 2
     printf '%-10s %10s %10s %12s ms\n' "$name" "$size" "$rss" "$ms"
     echo "$name $size $rss $ms" >> "$results"
 done

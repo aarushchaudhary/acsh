@@ -26,8 +26,11 @@ $(TARGET): $(SRC) $(HDR) .build-flags
 # stripped: the release build. Meant for musl: on Alpine plain
 # `make static` (MINIMAL=1 works too); on a glibc system install
 # musl-tools and run `make static CC=musl-gcc`.
+# Not position-independent: a static PIE carries a relocation for every
+# pointer in its tables and rewrites them at startup (bigger, and more
+# pages touched); BusyBox's static build is not PIE either.
 SIZEFLAGS = -Os -ffunction-sections -fdata-sections -Wl,--gc-sections \
-            -fno-asynchronous-unwind-tables -fno-unwind-tables
+            -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-pie -no-pie
 static: acsh-static
 
 acsh-static: $(SRC) $(HDR) .build-flags
