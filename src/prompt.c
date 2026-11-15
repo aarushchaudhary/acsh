@@ -23,7 +23,7 @@
  * PS1 and PS2 are never exported (vars.c), so a prompt written with
  * these escapes cannot break another shell started from acsh. */
 
-#define ACSH_VERSION "0.3"
+#define ACSH_VERSION "2.0.0"
 
 /* Around text that takes no room on screen; stripped when printing,
  * used by the line editor to measure the prompt. */

@@ -50,6 +50,10 @@ against the BusyBox 1.36 that Ubuntu and Alpine ship in CI.
 
 ## Quick start
 
+Prebuilt binaries (static, for x86_64 and aarch64, with checksums) are on
+the [Releases](https://github.com/aarushchaudhary/acsh/releases) page.
+To build from source:
+
 ```sh
 git clone <this repository> acsh && cd acsh
 make                # one binary, ./acsh (gcc or clang, any libc)
@@ -658,6 +662,7 @@ acsh/
 ├── compile_flags.txt          include path for editors (clangd)
 ├── config/acshrc.default      a starting ~/.acshrc
 ├── docs/posix_compliance.md   POSIX, section by section: status and tests
+├── docs/releases/             release notes, one file per version
 ├── include/
 │   ├── acsh.h                 the module API shared by all files
 │   └── syntax.h               syntax tree, lexer and parser API
@@ -673,7 +678,7 @@ acsh/
 │   ├── bench/                 bench.sh and its timer, runs.c
 │   ├── complaints.sh          the community re-check
 │   └── fuzz/                  libFuzzer targets
-└── .github/workflows/         ci.yml, release.yml
+└── .github/workflows/         ci.yml; release.yml (a vX.Y.Z tag: test, build, publish)
 ```
 
 ---
