@@ -435,7 +435,7 @@ static void test_lineedit(void) {
     typed(s, "set +o ignoreeof", NULL);
     ssend(s, key("C-d"), 0.5);
     pid_t done = waitpid(s->pid, NULL, WNOHANG);
-    for (int i = 0; i < 10 && done == 0; i++) {
+    for (int i = 0; i < 50 && done == 0; i++) {   /* up to 5 s: exit also saves history */
         sread(s, 0.1);
         done = waitpid(s->pid, NULL, WNOHANG);
     }

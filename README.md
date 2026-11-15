@@ -116,24 +116,37 @@ long values and long lists, and a memory leak in the parser. Each has a
 test in `test_acsh.sh` [3.1] or `tests/crash/`. CI fuzzes both targets
 for 2 more minutes on every push.
 
-### Size, memory, startup
+### Size, memory, startup against a standalone ash
 
-`tests/bench/bench.sh`; memory is the shell's own idle RSS, read with
-builtins only; startup is 1,000 runs of `-c true` (best of three runs).
+The fair comparison: both statically linked with musl, BusyBox built
+with only `ash` (with line editing and history, as Alpine configures
+it), acsh with `make static` (`-Oz`, not position-independent, as
+BusyBox's static build). `tests/bench/bench.sh`, best of three runs;
+memory is the shell's own idle RSS, read with builtins only. Measured
+locally with Ubuntu's musl-gcc 15; the CI `bench` job measures the same
+on Alpine (its absolute numbers are a little smaller for both shells).
 
 | Build | Size (stripped) | Idle RSS | 1,000 × `-c true` |
 |---|---|---|---|
-| BusyBox `ash` 1.37.0 (static, all applets) | 2,190,672 B | 1,708 KB | 331 ms |
-| acsh, `make static` (static glibc) | 1,403,328 B | 1,388 KB | 314 ms |
-| acsh, `make static MINIMAL=1` (static glibc) | 1,391,040 B | 1,380 KB | 309 ms |
-| acsh code alone, release flags, dynamic | 133,352 B | | |
-| acsh code alone, `MINIMAL=1`, dynamic | 121,064 B | | |
+| BusyBox 1.36.1 `ash` only | 223,032 B | 264–268 KB | 244–276 ms |
+| acsh `MINIMAL=1` | 243,408 B | 280 KB | 253–288 ms |
+| acsh full | 251,600 B | 292–296 KB | 251–285 ms |
 
-The static glibc sizes are mostly glibc itself; acsh's own code is the
-121–133 KB in the last two rows. On Alpine, statically linked with
-musl, the `bench` CI job compares acsh with an `ash`-only BusyBox and
-checks the roadmap's targets: the minimal build no bigger, heavier or
-slower than `ash`, the full build within 1.5× of its size.
+| Roadmap target | Result |
+|---|---|
+| minimal build no slower than `ash` | **met** (within 5%; with a full environment of 106 variables acsh starts faster: 1.22–1.29 s against 1.28–1.33 s for 5,000 runs) |
+| full build within 1.5× of `ash`'s size | **met** (1.13×) |
+| minimal build no bigger than `ash` | **not met**: 9% bigger (20 KB) |
+| minimal build no heavier than `ash` | **not met**: 12–16 KB more RSS |
+
+What closed most of the gap: building non-PIE and with `-Oz`; importing
+the environment with 2 allocations instead of 3 per variable (startup
+was 13–25% slower before); allocating the function-call frames and
+seeding `$RANDOM` only when first needed (memory was 40 KB higher).
+The rest is acsh's own code (about 20 KB more than `ash`'s); removing
+features to close it was ruled out. The `bench` job reports the two
+unmet targets as known gaps and fails if they are ever met, so the
+gate can be made strict.
 
 ### The community complaints, re-checked
 
@@ -262,6 +275,10 @@ These are known gaps:
 
 - **vi editing mode.** acsh's line editor has emacs keys only;
   `set -o vi` is accepted but does nothing.
+- **Size and memory of the smallest build.** Statically linked with musl,
+  `make static MINIMAL=1` is 9% bigger than an `ash`-only BusyBox and
+  uses 12–16 KB more memory; it starts as fast. See
+  [Evidence](#evidence).
 - **Speed of long scripts.** BusyBox runs many applets (for example
   `ls` and `cat`) inside the shell process without forking; acsh always
   runs external programs. On a pure arithmetic loop

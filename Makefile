@@ -29,7 +29,9 @@ $(TARGET): $(SRC) $(HDR) .build-flags
 # Not position-independent: a static PIE carries a relocation for every
 # pointer in its tables and rewrites them at startup (bigger, and more
 # pages touched); BusyBox's static build is not PIE either.
-SIZEFLAGS = -Os -ffunction-sections -fdata-sections -Wl,--gc-sections \
+# -Oz (gcc 12+, clang) where the compiler has it, as BusyBox uses
+OPT_SIZE := $(shell $(CC) -Oz -x c -c -o /dev/null /dev/null 2>/dev/null && echo -Oz || echo -Os)
+SIZEFLAGS = $(OPT_SIZE) -ffunction-sections -fdata-sections -Wl,--gc-sections \
             -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-pie -no-pie
 static: acsh-static
 

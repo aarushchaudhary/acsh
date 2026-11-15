@@ -16,8 +16,15 @@ typedef struct Var {
     char       *name;
     char       *value;  /* NULL: declared (export x / readonly x) but unset */
     int         flags;  /* V_EXPORT, V_READONLY */
+    unsigned char owns; /* which of struct, name, value were allocated alone */
     struct Var *next;
 } Var;
+
+/* Variables inherited at startup live in one block, their names in one
+ * buffer, their values in the environment strings themselves: 2
+ * allocations instead of 3 per variable (a shell starts often, with
+ * a hundred variables). Anything set later is allocated on its own. */
+enum { OWN_STRUCT = 1, OWN_NAME = 2, OWN_VALUE = 4 };
 
 #define NBUCKETS 256
 static Var *table[NBUCKETS];
@@ -41,6 +48,7 @@ static Var *create(const char *name) {
         shell_error("out of memory\n");
         exit(2);
     }
+    v->owns = OWN_STRUCT | OWN_NAME;
     unsigned h = hash(name);
     v->next = table[h];
     table[h] = v;
@@ -56,16 +64,38 @@ int var_valid_name(const char *name) {
 }
 
 void vars_init(void) {
+    size_t n = 0, bytes = 0;
     for (char **e = environ; e != NULL && *e != NULL; e++) {
         const char *eq = strchr(*e, '=');
         if (eq == NULL) continue;
-        char *name = strndup(*e, (size_t)(eq - *e));
-        if (name != NULL && var_valid_name(name) && find(name) == NULL) {
-            Var *v = create(name);
-            v->value = strdup(eq + 1);
-            v->flags = V_EXPORT;
-        }
-        free(name);
+        n++;
+        bytes += (size_t)(eq - *e) + 1;
+    }
+    if (n == 0) return;
+    Var *block = calloc(n, sizeof(Var));
+    char *names = malloc(bytes);
+    if (block == NULL || names == NULL) {
+        shell_error("out of memory\n");
+        exit(2);
+    }
+    size_t used = 0;
+    for (char **e = environ; e != NULL && *e != NULL; e++) {
+        const char *eq = strchr(*e, '=');
+        if (eq == NULL) continue;
+        size_t len = (size_t)(eq - *e);
+        char *name = names + used;
+        memcpy(name, *e, len);
+        name[len] = '\0';
+        if (!var_valid_name(name) || find(name) != NULL) continue;
+        used += len + 1;
+        Var *v = block++;
+        v->name = name;
+        v->value = (char *)eq + 1;     /* the environment's own string */
+        v->flags = V_EXPORT;
+        v->owns = 0;
+        unsigned h = hash(name);
+        v->next = table[h];
+        table[h] = v;
     }
 }
 
@@ -91,8 +121,9 @@ int var_set(const char *name, const char *value) {
         shell_error("out of memory\n");
         exit(2);
     }
-    free(v->value);
+    if (v->owns & OWN_VALUE) free(v->value);
     v->value = copy;
+    v->owns |= OWN_VALUE;
     if (shell_option('a')) v->flags |= V_EXPORT; /* set -a */
     if (strcmp(name, "RANDOM") == 0) env_seed_random(strtoul(copy, NULL, 10));
     return 0;
@@ -108,9 +139,9 @@ int var_unset(const char *name) {
             return -1;
         }
         *pp = v->next;
-        free(v->name);
-        free(v->value);
-        free(v);
+        if (v->owns & OWN_NAME) free(v->name);
+        if (v->owns & OWN_VALUE) free(v->value);
+        if (v->owns & OWN_STRUCT) free(v);
         return 0;
     }
     return 0;
@@ -147,8 +178,9 @@ void var_restore(VarSave *s) {
         }
     } else {
         if (v == NULL) v = create(s->name);
-        free(v->value);
+        if (v->owns & OWN_VALUE) free(v->value);
         v->value = s->value;
+        v->owns |= OWN_VALUE;
         v->flags = s->flags;
         s->value = NULL;
     }

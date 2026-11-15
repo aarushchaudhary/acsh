@@ -35,7 +35,7 @@ typedef struct {
     int       nlocals;
 } Frame;
 
-static Frame frames[ACSH_MAX_CALL_DEPTH];
+static Frame *frames = NULL;  /* ACSH_MAX_CALL_DEPTH of them, allocated at the first call */
 static int   depth = 0;
 
 /* The script's own arguments ($1... outside any function): set from
@@ -75,6 +75,10 @@ static void free_params(Frame *f) {
 void env_push_positional_params(int argc, char *argv[]) {
     if (depth >= ACSH_MAX_CALL_DEPTH) {
         return; /* function_call() refuses to recurse this deep first */
+    }
+    if (frames == NULL && (frames = calloc(ACSH_MAX_CALL_DEPTH, sizeof(Frame))) == NULL) {
+        shell_error("out of memory\n");
+        exit(2);
     }
     Frame *f = &frames[depth++];
     f->params = copy_params(argc, argv);
@@ -181,14 +185,21 @@ const char *env_positional(int i) {
     return current_frame()->params[i - 1];
 }
 
-/* $RANDOM: a new number 0..32767 on each read; assigning seeds it. */
+/* $RANDOM: a new number 0..32767 on each read; assigning seeds it.
+ * Seeded from the clock at the first read, not at startup: most runs
+ * never read it, and reading the clock costs a page (the vDSO). */
 static unsigned long random_state = 1;
+static int random_seeded = 0;
 
 void env_seed_random(unsigned long seed) {
     random_state = seed;
+    random_seeded = 1;
 }
 
 static long next_random(void) {
+    if (!random_seeded) {
+        env_seed_random((unsigned long)time(NULL) ^ ((unsigned long)getpid() << 16));
+    }
     random_state = random_state * 1103515245UL + 12345UL;
     return (long)((random_state >> 16) & 0x7fff);
 }
@@ -208,7 +219,6 @@ void env_init(const char *name, int argc, char *argv[]) {
     free(shell_name);
     shell_name = strdup(name);
     shell_pid = getpid();
-    random_state = (unsigned long)time(NULL) ^ ((unsigned long)shell_pid << 16);
     env_set_positional_params(argc, argv);
 }
 
